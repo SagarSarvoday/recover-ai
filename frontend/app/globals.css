@@ -1,0 +1,6 @@
+@import url("https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap");
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: #f7f8fa; color: #111827; font-family: "Manrope", Arial, sans-serif; }
+button { font: inherit; }

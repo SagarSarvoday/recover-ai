@@ -1,0 +1,1 @@
+"""RecoverAI FastAPI application package."""
