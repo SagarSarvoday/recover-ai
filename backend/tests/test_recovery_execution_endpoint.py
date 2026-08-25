@@ -48,6 +48,7 @@ class RecoveryExecutionEndpointTests(unittest.TestCase):
             attempt_count=0,
             ai_decision="retry",
             ai_decision_note="The payment can be retried once.",
+            razorpay_payment_link_id=None,
         )
         self.payment = SimpleNamespace(
         id=self.payment_id,
@@ -70,6 +71,9 @@ class RecoveryExecutionEndpointTests(unittest.TestCase):
         self.assertTrue(response.action_execution_result.success)
 
     def test_analyzed_contact_executes_payment_link_tool(self) -> None:
+        # This endpoint test verifies the persisted-action dispatch without performing
+        # an external provider call. Dedicated action tests cover link creation.
+        self.case.razorpay_payment_link_id = "plink_existing"
         response = self.execute_persisted_decision("contact")
 
         self.assertEqual(response.action_execution_result.action, "create_payment_link")

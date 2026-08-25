@@ -41,6 +41,7 @@ class RecoveryCase(Base):
         unique=True,
         nullable=False,
     )
+    razorpay_payment_link_id: Mapped[str | None] = mapped_column(Text, unique=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="open")
     amount_at_risk: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     amount_recovered: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, server_default="0")

@@ -1,5 +1,5 @@
 -- RecoverAI — PostgreSQL schema (hackathon MVP)
--- Tables: customers, payments, recovery_cases, audit_logs
+-- Tables: customers, payments, recovery_cases, audit_logs, razorpay_webhook_events
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
@@ -11,6 +11,7 @@ CREATE TABLE customers (
     name          TEXT NOT NULL,
     email         TEXT NOT NULL UNIQUE,
     phone         TEXT,
+    razorpay_customer_id TEXT UNIQUE,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -27,6 +28,8 @@ CREATE TABLE payments (
     currency        TEXT NOT NULL DEFAULT 'INR',
     status          TEXT NOT NULL CHECK (status IN ('pending', 'succeeded', 'failed')),
     failure_reason  TEXT,
+    razorpay_payment_id TEXT UNIQUE,
+    razorpay_success_payment_id TEXT UNIQUE,
     paid_at         TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -38,6 +41,8 @@ CREATE TABLE payments (
 
 CREATE INDEX idx_payments_customer_id ON payments (customer_id);
 CREATE INDEX idx_payments_status ON payments (status);
+CREATE INDEX idx_payments_razorpay_payment_id ON payments (razorpay_payment_id);
+CREATE INDEX idx_payments_razorpay_success_payment_id ON payments (razorpay_success_payment_id);
 
 -- ---------------------------------------------------------------------------
 -- recovery_cases
@@ -51,6 +56,7 @@ CREATE TABLE recovery_cases (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     customer_id       UUID NOT NULL REFERENCES customers (id) ON DELETE CASCADE,
     payment_id        UUID NOT NULL UNIQUE REFERENCES payments (id) ON DELETE CASCADE,
+    razorpay_payment_link_id TEXT UNIQUE,
     status            TEXT NOT NULL DEFAULT 'open'
                       CHECK (status IN ('open', 'in_progress', 'recovered', 'closed')),
     amount_at_risk    NUMERIC(12, 2) NOT NULL CHECK (amount_at_risk >= 0),
@@ -72,6 +78,8 @@ CREATE TABLE recovery_cases (
 
 CREATE INDEX idx_recovery_cases_customer_id ON recovery_cases (customer_id);
 CREATE INDEX idx_recovery_cases_status ON recovery_cases (status);
+CREATE INDEX idx_recovery_cases_razorpay_payment_link_id
+    ON recovery_cases (razorpay_payment_link_id);
 
 -- ---------------------------------------------------------------------------
 -- audit_logs
@@ -89,3 +97,22 @@ CREATE TABLE audit_logs (
 
 CREATE INDEX idx_audit_logs_entity ON audit_logs (entity_type, entity_id);
 CREATE INDEX idx_audit_logs_created_at ON audit_logs (created_at);
+
+-- ---------------------------------------------------------------------------
+-- razorpay_webhook_events
+-- Idempotency and minimal audit trail for external Razorpay webhook deliveries.
+-- Raw payloads are deliberately not persisted here.
+-- ---------------------------------------------------------------------------
+CREATE TABLE razorpay_webhook_events (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    razorpay_event_id   TEXT NOT NULL UNIQUE,
+    event_type          TEXT NOT NULL,
+    external_entity_id  TEXT,
+    processing_status   TEXT NOT NULL CHECK (
+                            processing_status IN ('processed', 'ignored')
+                         ),
+    received_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_razorpay_webhook_events_event_type
+    ON razorpay_webhook_events (event_type);

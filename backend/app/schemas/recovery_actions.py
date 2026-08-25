@@ -2,6 +2,7 @@ from typing import Literal
 from uuid import UUID
 from decimal import Decimal
 from pydantic import BaseModel, ConfigDict, Field
+from app.schemas.recovery_analysis import RecoveryAnalysisResponse
 
 RecoveryRecommendedAction = Literal["retry", "contact", "wait", "skip", "close"]
 RecoveryToolAction = Literal[
@@ -52,12 +53,14 @@ class StopRecoveryInput(RecoveryToolInput):
 class ActionResult(BaseModel):
     case_id: UUID
     action: RecoveryToolAction
-    status: Literal["simulated"] = "simulated"
+    status: Literal["simulated", "completed", "failed"] = "simulated"
     success: bool
     outcome: Literal["recovered", "failed", "scheduled", "stopped", "blocked"]
     amount_recovered: Decimal = Decimal("0.00")
     message: str
     guardrails_applied: list[str] = Field(default_factory=list)
+    payment_link_id: str | None = None
+    payment_link_url: str | None = None
 
 
 class PersistedAIRecommendation(BaseModel):
@@ -71,3 +74,9 @@ class RecoveryActionExecutionResponse(BaseModel):
     case_id: UUID
     ai_recommendation: PersistedAIRecommendation
     action_execution_result: ActionResult
+
+class RecoveryWorkflowResponse(BaseModel):
+    """Combined response for AI analysis followed by action execution."""
+
+    analysis: RecoveryAnalysisResponse
+    execution: RecoveryActionExecutionResponse

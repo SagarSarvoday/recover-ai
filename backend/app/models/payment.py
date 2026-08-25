@@ -34,6 +34,8 @@ class Payment(Base):
     currency: Mapped[str] = mapped_column(Text, nullable=False, server_default="INR")
     status: Mapped[str] = mapped_column(Text, nullable=False)
     failure_reason: Mapped[str | None] = mapped_column(Text)
+    razorpay_payment_id: Mapped[str | None] = mapped_column(Text, unique=True)
+    razorpay_success_payment_id: Mapped[str | None] = mapped_column(Text, unique=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

@@ -16,6 +16,7 @@ from app.schemas.recovery_actions import (
     PersistedAIRecommendation,
     RecoveryActionContext,
     RecoveryActionExecutionResponse,
+    RecoveryWorkflowResponse,
 )
 from app.services.recovery_actions import (
     InvalidRecoveryActionError,
@@ -190,4 +191,23 @@ def execute_recovery_case(
             reason=case.ai_decision_note,
         ),
         action_execution_result=action_result,
+    )
+
+@router.post(
+    "/recovery-cases/{case_id}/run",
+    response_model=RecoveryWorkflowResponse,
+    summary="Analyze and execute a recovery workflow",
+)
+def run_recovery_workflow(
+    case_id: UUID,
+    db: Session = Depends(get_db),
+) -> RecoveryWorkflowResponse:
+
+    analysis = analyze_recovery_case(case_id, db)
+
+    execution = execute_recovery_case(case_id, db)
+
+    return RecoveryWorkflowResponse(
+        analysis=analysis,
+        execution=execution,
     )

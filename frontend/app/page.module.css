@@ -30,3 +30,42 @@
 .errorState,.emptyState { min-height: 200px; padding: 35px 28px; display: flex; justify-content: center; flex-direction: column; gap: 8px; color: #455366; }.errorState strong,.emptyState strong { color: #273244; font-size: 14px; }.errorState span,.emptyState span { font-size: 12px; color: #7b8593; max-width: 560px; line-height: 1.6; }.errorState button { align-self: flex-start; margin-top: 10px; padding: 8px 12px; border: 0; color: #fff; background: #137c62; border-radius: 7px; cursor: pointer; font-size: 12px; font-weight: 700; }.loadingTable { padding: 11px 27px 19px; display: grid; gap: 12px; }.loadingTable span { height: 48px; border-radius: 8px; background: linear-gradient(90deg,#f3f5f6 25%,#fafbfb 45%,#f3f5f6 65%); background-size: 200% 100%; animation: shimmer 1.3s infinite; }
 @media (max-width: 1050px) { .metrics { grid-template-columns: repeat(2,minmax(0,1fr)); }.sidebar { width: 208px; flex-basis: 208px; } }
 @media (max-width: 700px) { .shell { display: block; }.sidebar { width: 100%; min-height: auto; height: auto; padding: 16px 20px; position: static; flex-direction: row; align-items: center; }.nav { margin: 0 0 0 auto; display: flex; }.nav a { padding: 8px; font-size: 0; }.nav a span { font-size: 18px; }.sidebarFooter { display: none; }.content { padding: 38px 18px; }.header { display: block; }.header h1 { letter-spacing: -1.5px; }.refresh { margin-top: 22px; }.metrics { margin-top: 30px; gap: 10px; }.metricCard { min-height: 130px; padding: 16px; }.metricCard strong { font-size: 20px; }.tableSection { margin-top: 34px; }.sectionHead { padding: 20px; }.updated { display: none; }.tableWrap th,.tableWrap td { padding-left: 16px; padding-right: 16px; } }
+.actionButton {
+  border: 1px solid #b9dcd2;
+  background: #eefaf6;
+  color: #087858;
+  padding: 7px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.actionButton:hover {
+  background: #dff5ed;
+  border-color: #8fcbbb;
+}
+
+.actionButton:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.actionDone {
+  color: #08795b;
+  font: 600 10px "DM Mono", monospace;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.actionMessage {
+  margin-top: 18px;
+  padding: 11px 14px;
+  border: 1px solid #d7ebe5;
+  background: #f1faf7;
+  color: #087858;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 600;
+}
