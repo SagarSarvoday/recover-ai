@@ -333,6 +333,22 @@ def create_payment_link(
         _record_action_attempt(db, result, tool_input.context, execution_context.actor, simulated=False)
         return result
 
+    customer_email = getattr(customer, "email", None)
+    customer_phone = getattr(customer, "phone", None)
+    if not customer_email and not customer_phone:
+        result = ActionResult(
+            case_id=case.id,
+            action="create_payment_link",
+            status="failed",
+            success=False,
+            outcome="blocked",
+            amount_recovered=Decimal("0.00"),
+            message="Customer contact information is unavailable for payment-link delivery.",
+            guardrails_applied=["customer_contact_information_missing"],
+        )
+        _record_action_attempt(db, result, tool_input.context, execution_context.actor, simulated=False)
+        return result
+
     payment = db.get(Payment, case.payment_id)
     if payment is None:
         result = ActionResult(
@@ -372,8 +388,8 @@ def create_payment_link(
         reference_id=str(case.id),
         description=f"RecoverAI recovery payment for case {case.id}",
         customer_name=customer.name,
-        customer_email=customer.email,
-        customer_contact=customer.phone,
+        customer_email=customer_email,
+        customer_contact=customer_phone,
     )
     razorpay_service = execution_context.razorpay_service or RazorpayService(settings)
     try:

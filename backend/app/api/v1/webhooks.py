@@ -67,10 +67,6 @@ async def receive_razorpay_webhook(
     try:
         payload = json.loads(raw_body)
 
-        print("\n========== RAZORPAY WEBHOOK PAYLOAD ==========")
-        print(json.dumps(payload, indent=2))
-        print("===============================================\n")
-
         webhook = RazorpayWebhookEnvelope.model_validate(payload)
 
         external_entity_id = extract_external_entity_id(webhook)

@@ -15,9 +15,9 @@ class RecoveryCaseResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
-    customer_id: UUID
-    customer_name: str
-    customer_email: str
+    customer_id: UUID | None
+    customer_name: str | None
+    customer_email: str | None
     payment_id: UUID
     payment_status: str
     failure_reason: str | None
@@ -36,14 +36,14 @@ class RecoveryCaseResponse(BaseModel):
     def from_models(
         cls,
         case: RecoveryCase,
-        customer: Customer,
+        customer: Customer | None,
         payment: Payment,
     ) -> "RecoveryCaseResponse":
         return cls(
             id=case.id,
             customer_id=case.customer_id,
-            customer_name=customer.name,
-            customer_email=customer.email,
+            customer_name=customer.name if customer is not None else None,
+            customer_email=customer.email if customer is not None else None,
             payment_id=case.payment_id,
             payment_status=payment.status,
             failure_reason=payment.failure_reason,

@@ -27,8 +27,8 @@ class Payment(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    customer_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("customers.id", ondelete="SET NULL")
     )
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(Text, nullable=False, server_default="INR")
@@ -41,5 +41,5 @@ class Payment(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    customer: Mapped["Customer"] = relationship(back_populates="payments")
+    customer: Mapped["Customer | None"] = relationship(back_populates="payments")
     recovery_case: Mapped["RecoveryCase | None"] = relationship(back_populates="payment")

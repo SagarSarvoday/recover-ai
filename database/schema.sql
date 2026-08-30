@@ -8,8 +8,8 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- ---------------------------------------------------------------------------
 CREATE TABLE customers (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name          TEXT NOT NULL,
-    email         TEXT NOT NULL UNIQUE,
+    name          TEXT,
+    email         TEXT UNIQUE,
     phone         TEXT,
     razorpay_customer_id TEXT UNIQUE,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -23,7 +23,7 @@ CREATE TABLE customers (
 -- ---------------------------------------------------------------------------
 CREATE TABLE payments (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    customer_id     UUID NOT NULL REFERENCES customers (id) ON DELETE CASCADE,
+    customer_id     UUID REFERENCES customers (id) ON DELETE SET NULL,
     amount          NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
     currency        TEXT NOT NULL DEFAULT 'INR',
     status          TEXT NOT NULL CHECK (status IN ('pending', 'succeeded', 'failed')),
@@ -54,7 +54,7 @@ CREATE INDEX idx_payments_razorpay_success_payment_id ON payments (razorpay_succ
 -- ---------------------------------------------------------------------------
 CREATE TABLE recovery_cases (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    customer_id       UUID NOT NULL REFERENCES customers (id) ON DELETE CASCADE,
+    customer_id       UUID REFERENCES customers (id) ON DELETE SET NULL,
     payment_id        UUID NOT NULL UNIQUE REFERENCES payments (id) ON DELETE CASCADE,
     razorpay_payment_link_id TEXT UNIQUE,
     status            TEXT NOT NULL DEFAULT 'open'

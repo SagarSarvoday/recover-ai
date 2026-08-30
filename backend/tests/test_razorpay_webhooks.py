@@ -58,7 +58,11 @@ class FakeSession:
                 (
                     customer
                     for customer in self.customers
-                    if customer.razorpay_customer_id in values or customer.email in values
+                    if (
+                        customer.razorpay_customer_id in values
+                        or customer.email in values
+                        or customer.phone in values
+                    )
                 ),
                 None,
             )
@@ -244,14 +248,14 @@ class RazorpayWebhookTests(unittest.TestCase):
         self.assertEqual(len(self.db.payments), 1)
         self.assertEqual(len(self.db.recovery_cases), 1)
 
-    def test_incomplete_payment_payload_is_ignored_without_creating_records(self) -> None:
+    def test_phone_only_identity_creates_a_partial_customer(self) -> None:
         payload = {
             "event": "payment.failed",
             "payload": {
                 "payment": {
                     "entity": {
-                        "id": "pay_incomplete",
-                        "email": "missing-name@example.com",
+                        "id": "pay_phone_only",
+                        "contact": "+91 99999-99999",
                         "amount": 1000,
                         "currency": "INR",
                         "error_reason": "payment_failed",
@@ -261,13 +265,91 @@ class RazorpayWebhookTests(unittest.TestCase):
         }
         response = self.post(
             json.dumps(payload).encode(),
-            {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_9"},
+            {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_phone_only"},
         )
 
-        self.assertEqual(response.status, "ignored")
+        self.assertEqual(response.status, "processed")
+        self.assertEqual(len(self.db.customers), 1)
+        self.assertIsNone(self.db.customers[0].name)
+        self.assertIsNone(self.db.customers[0].email)
+        self.assertEqual(self.db.customers[0].phone, "+919999999999")
+        self.assertEqual(self.db.payments[0].customer_id, self.db.customers[0].id)
+        self.assertEqual(self.db.recovery_cases[0].customer_id, self.db.customers[0].id)
+
+    def test_payment_without_customer_identity_creates_payment_only_case(self) -> None:
+        payload = json.loads(webhook_body("payment.failed"))
+        entity = payload["payload"]["payment"]["entity"]
+        entity["id"] = "pay_no_identity"
+        for field in ("customer_id", "email", "contact", "notes"):
+            entity.pop(field, None)
+
+        response = self.post(
+            json.dumps(payload).encode(),
+            {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_no_identity"},
+        )
+
+        self.assertEqual(response.status, "processed")
         self.assertEqual(len(self.db.customers), 0)
+        self.assertEqual(len(self.db.payments), 1)
+        self.assertEqual(len(self.db.recovery_cases), 1)
+        self.assertIsNone(self.db.payments[0].customer_id)
+        self.assertIsNone(self.db.recovery_cases[0].customer_id)
+
+    def test_placeholder_email_is_not_customer_identity(self) -> None:
+        payload = json.loads(webhook_body("payment.failed"))
+        entity = payload["payload"]["payment"]["entity"]
+        entity["id"] = "pay_placeholder_email"
+        entity["email"] = "void@razorpay.com"
+        for field in ("customer_id", "contact", "notes"):
+            entity.pop(field, None)
+
+        response = self.post(
+            json.dumps(payload).encode(),
+            {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_placeholder_email"},
+        )
+
+        self.assertEqual(response.status, "processed")
+        self.assertEqual(len(self.db.customers), 0)
+        self.assertIsNone(self.db.payments[0].customer_id)
+        self.assertIsNone(self.db.recovery_cases[0].customer_id)
+
+    def test_missing_payment_id_is_rejected_without_creating_records(self) -> None:
+        payload = json.loads(webhook_body("payment.failed"))
+        payload["payload"]["payment"]["entity"].pop("id")
+
+        with self.assertRaises(HTTPException) as error:
+            self.post(
+                json.dumps(payload).encode(),
+                {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_missing_id"},
+            )
+
+        self.assertEqual(error.exception.status_code, 400)
         self.assertEqual(len(self.db.payments), 0)
         self.assertEqual(len(self.db.recovery_cases), 0)
+
+    def test_missing_amount_or_currency_is_ignored_without_creating_records(self) -> None:
+        for field in ("amount", "currency"):
+            with self.subTest(field=field):
+                db = FakeSession()
+                payload = json.loads(webhook_body("payment.failed"))
+                payload["payload"]["payment"]["entity"].pop(field)
+                response = asyncio.run(
+                    receive_razorpay_webhook(
+                        make_request(
+                            json.dumps(payload).encode(),
+                            {
+                                "X-Razorpay-Signature": "valid",
+                                "X-Razorpay-Event-Id": f"evt_missing_{field}",
+                            },
+                        ),
+                        db,
+                        self.service,
+                    )
+                )
+
+                self.assertEqual(response.status, "ignored")
+                self.assertEqual(len(db.payments), 0)
+                self.assertEqual(len(db.recovery_cases), 0)
 
     def test_duplicate_paid_link_event_does_not_recover_twice(self) -> None:
         self.create_mapped_recovery_case()

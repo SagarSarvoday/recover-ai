@@ -381,7 +381,7 @@ return (
                       <td>
                         <div className={styles.customer}>
                           <span className={styles.customerAvatar}>
-                            {item.customer_name.slice(0, 1).toUpperCase()}
+                            {(item.customer_name ?? "?").slice(0, 1).toUpperCase()}
                           </span>
 
                           <span>

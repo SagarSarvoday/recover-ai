@@ -46,7 +46,7 @@ def list_recovery_cases(db: Session = Depends(get_db)) -> list[RecoveryCaseRespo
     try:
         rows = db.execute(
             select(RecoveryCase, Customer, Payment)
-            .join(Customer, RecoveryCase.customer_id == Customer.id)
+            .outerjoin(Customer, RecoveryCase.customer_id == Customer.id)
             .join(Payment, RecoveryCase.payment_id == Payment.id)
             .order_by(RecoveryCase.created_at.desc())
         ).all()
@@ -76,12 +76,12 @@ def analyze_recovery_case(case_id: UUID, db: Session = Depends(get_db)) -> Recov
                 detail="Recovery case not found.",
             )
 
-        customer = db.get(Customer, case.customer_id)
+        customer = db.get(Customer, case.customer_id) if case.customer_id is not None else None
         payment = db.get(Payment, case.payment_id)
-        if customer is None or payment is None:
+        if payment is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Recovery case is missing related customer or payment data.",
+                detail="Recovery case is missing its related payment data.",
             )
 
         context = build_recovery_context(

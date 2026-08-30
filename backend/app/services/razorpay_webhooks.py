@@ -30,11 +30,39 @@ class RazorpayFailedPaymentData:
     payment_id: str
     customer_id: str | None
     customer_name: str | None
-    customer_email: str
+    customer_email: str | None
     customer_contact: str | None
     amount: Decimal
     currency: str
     failure_reason: str
+
+
+PLACEHOLDER_EMAILS = {"void@razorpay.com"}
+
+
+def _usable_email(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    email = value.strip().lower()
+    if not email or email in PLACEHOLDER_EMAILS or "@" not in email:
+        return None
+    return email
+
+
+def _normalize_phone(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    digits = "".join(character for character in value if character.isdigit())
+    if not 7 <= len(digits) <= 15:
+        return None
+    return f"+{digits}"
+
+
+def _optional_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
 
 
 @dataclass(frozen=True)
@@ -113,30 +141,22 @@ def extract_failed_payment_data(webhook: RazorpayWebhookEnvelope) -> RazorpayFai
 
     notes = entity.get("notes") if isinstance(entity.get("notes"), dict) else {}
     payment_id = entity.get("id")
-    customer_id = entity.get("customer_id")
-    customer_email = entity.get("email")
-    customer_name = entity.get("customer_name") or notes.get("customer_name") or notes.get("name")
-    customer_contact = entity.get("contact")
+    customer_id = _optional_text(entity.get("customer_id"))
+    customer_email = _usable_email(entity.get("email"))
+    customer_name = _optional_text(
+        entity.get("customer_name") or notes.get("customer_name") or notes.get("name")
+    )
+    customer_contact = _normalize_phone(entity.get("contact"))
     amount = entity.get("amount")
     currency = entity.get("currency")
-    failure_reason = entity.get("error_description") or entity.get("error_reason")
+    failure_reason = _optional_text(entity.get("error_description") or entity.get("error_reason"))
 
     if not isinstance(payment_id, str) or not payment_id:
         raise IncompleteRazorpayPaymentPayloadError("Missing Razorpay payment identifier.")
-    if customer_id is not None and (not isinstance(customer_id, str) or not customer_id):
-        raise IncompleteRazorpayPaymentPayloadError("Invalid Razorpay customer identifier.")
-    if not isinstance(customer_email, str) or not customer_email:
-        raise IncompleteRazorpayPaymentPayloadError("Missing customer email.")
-    if customer_name is not None and (not isinstance(customer_name, str) or not customer_name):
-        raise IncompleteRazorpayPaymentPayloadError("Invalid customer name.")
-    if customer_contact is not None and not isinstance(customer_contact, str):
-        raise IncompleteRazorpayPaymentPayloadError("Invalid customer contact.")
     if not isinstance(amount, int) or amount <= 0:
         raise IncompleteRazorpayPaymentPayloadError("Missing or invalid payment amount.")
     if not isinstance(currency, str) or len(currency) != 3:
         raise IncompleteRazorpayPaymentPayloadError("Missing or invalid payment currency.")
-    if not isinstance(failure_reason, str) or not failure_reason:
-        raise IncompleteRazorpayPaymentPayloadError("Missing payment failure reason.")
 
     return RazorpayFailedPaymentData(
         payment_id=payment_id,
@@ -146,7 +166,7 @@ def extract_failed_payment_data(webhook: RazorpayWebhookEnvelope) -> RazorpayFai
         customer_contact=customer_contact,
         amount=Decimal(amount) / Decimal("100"),
         currency=currency.upper(),
-        failure_reason=failure_reason,
+        failure_reason=failure_reason or "Razorpay reported a failed payment.",
     )
 
 
@@ -191,37 +211,14 @@ def ingest_payment_failed_webhook(
     if not claimed:
         return "duplicate"
 
-    customer = None
-    if data.customer_id:
-        customer = db.scalar(
-            select(Customer).where(Customer.razorpay_customer_id == data.customer_id)
-        )
-    if customer is None:
-        customer = db.scalar(select(Customer).where(Customer.email == data.customer_email))
-    if customer is None:
-        if data.customer_name is None:
-            raise IncompleteRazorpayPaymentPayloadError(
-                "A customer name is required to create a new RecoverAI customer."
-            )
-        customer = Customer(
-            name=data.customer_name,
-            email=data.customer_email,
-            phone=data.customer_contact,
-            razorpay_customer_id=data.customer_id,
-        )
-        db.add(customer)
-        db.flush()
-    else:
-        if data.customer_id:
-            customer.razorpay_customer_id = data.customer_id
-        customer.phone = data.customer_contact or customer.phone
+    customer = resolve_customer_identity(db, data)
 
     payment = db.scalar(
         select(Payment).where(Payment.razorpay_payment_id == data.payment_id)
     )
     if payment is None:
         payment = Payment(
-            customer_id=customer.id,
+            customer_id=customer.id if customer is not None else None,
             amount=data.amount,
             currency=data.currency,
             status="failed",
@@ -231,7 +228,8 @@ def ingest_payment_failed_webhook(
         db.add(payment)
         db.flush()
     else:
-        payment.customer_id = customer.id
+        if customer is not None:
+            payment.customer_id = customer.id
         payment.amount = data.amount
         payment.currency = data.currency
         payment.status = "failed"
@@ -240,7 +238,7 @@ def ingest_payment_failed_webhook(
     recovery_case = db.scalar(select(RecoveryCase).where(RecoveryCase.payment_id == payment.id))
     if recovery_case is None:
         recovery_case = RecoveryCase(
-            customer_id=customer.id,
+            customer_id=payment.customer_id,
             payment_id=payment.id,
             status="open",
             amount_at_risk=data.amount,
@@ -249,6 +247,8 @@ def ingest_payment_failed_webhook(
         )
         db.add(recovery_case)
         db.flush()
+    elif customer is not None:
+        recovery_case.customer_id = customer.id
 
     db.add(
         AuditLog(
@@ -265,6 +265,46 @@ def ingest_payment_failed_webhook(
     )
     db.commit()
     return "processed"
+
+
+def resolve_customer_identity(
+    db: Session,
+    data: RazorpayFailedPaymentData,
+) -> Customer | None:
+    """Resolve only meaningful provider identity; financial ingestion never depends on it."""
+    customer = None
+    if data.customer_id:
+        customer = db.scalar(
+            select(Customer).where(Customer.razorpay_customer_id == data.customer_id)
+        )
+    if customer is None and data.customer_email:
+        customer = db.scalar(select(Customer).where(Customer.email == data.customer_email))
+    if customer is None and data.customer_contact:
+        customer = db.scalar(select(Customer).where(Customer.phone == data.customer_contact))
+
+    has_identity = any((data.customer_id, data.customer_email, data.customer_contact))
+    if customer is None and not has_identity:
+        return None
+    if customer is None:
+        customer = Customer(
+            name=data.customer_name,
+            email=data.customer_email,
+            phone=data.customer_contact,
+            razorpay_customer_id=data.customer_id,
+        )
+        db.add(customer)
+        db.flush()
+        return customer
+
+    if data.customer_id and customer.razorpay_customer_id in {None, data.customer_id}:
+        customer.razorpay_customer_id = data.customer_id
+    if data.customer_name and customer.name is None:
+        customer.name = data.customer_name
+    if data.customer_email and customer.email is None:
+        customer.email = data.customer_email
+    if data.customer_contact and customer.phone is None:
+        customer.phone = data.customer_contact
+    return customer
 
 
 def ingest_payment_link_paid_webhook(

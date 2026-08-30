@@ -32,8 +32,8 @@ class RecoveryCase(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    customer_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("customers.id", ondelete="SET NULL")
     )
     payment_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -56,5 +56,5 @@ class RecoveryCase(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
-    customer: Mapped["Customer"] = relationship(back_populates="recovery_cases")
+    customer: Mapped["Customer | None"] = relationship(back_populates="recovery_cases")
     payment: Mapped["Payment"] = relationship(back_populates="recovery_case")

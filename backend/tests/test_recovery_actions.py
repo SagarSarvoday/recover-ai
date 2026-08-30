@@ -14,7 +14,7 @@ from app.services.recovery_actions import (
 
 
 class FakeSession:
-    def __init__(self, case: object, payment: object, customer: object) -> None:
+    def __init__(self, case: object, payment: object, customer: object | None) -> None:
         self.case = case
         self.payment = payment
         self.customer = customer
@@ -26,7 +26,7 @@ class FakeSession:
             return self.case
         if model is Payment and object_id == self.payment.id:
             return self.payment
-        if model is Customer and object_id == self.customer.id:
+        if model is Customer and self.customer is not None and object_id == self.customer.id:
             return self.customer
         return None
 
@@ -214,6 +214,23 @@ class RecoveryActionTests(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertIn("case_already_recovered", result.guardrails_applied)
+        self.assertEqual(razorpay_service.requests, [])
+
+    def test_contact_without_customer_is_blocked_without_provider_call(self) -> None:
+        self.case.customer_id = None
+        self.payment.customer_id = None
+        self.db.customer = None
+        razorpay_service = FakeRazorpayService()
+        context = RecoveryActionExecutionContext(
+            db=self.db,
+            max_recovery_attempts=3,
+            razorpay_service=razorpay_service,  # type: ignore[arg-type]
+        )
+
+        result = execute_recovery_action("contact", self.case_id, context)
+
+        self.assertFalse(result.success)
+        self.assertIn("required_customer_information_missing", result.guardrails_applied)
         self.assertEqual(razorpay_service.requests, [])
 
 

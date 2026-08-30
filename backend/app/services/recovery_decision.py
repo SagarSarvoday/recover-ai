@@ -92,22 +92,25 @@ def _log_ollama_error(error: Exception) -> None:
 def build_recovery_context(
     db: Session,
     case: RecoveryCase,
-    customer: Customer,
+    customer: Customer | None,
     payment: Payment,
     max_recovery_attempts: int,
 ) -> RecoveryDecisionContext:
-    payment_history = db.scalars(
-        select(Payment)
-        .where(Payment.customer_id == customer.id)
-        .order_by(Payment.created_at.desc())
-        .limit(10)
-    ).all()
-    prior_cases = db.scalars(
-        select(RecoveryCase)
-        .where(RecoveryCase.customer_id == customer.id, RecoveryCase.id != case.id)
-        .order_by(RecoveryCase.updated_at.desc())
-        .limit(5)
-    ).all()
+    payment_history = []
+    prior_cases = []
+    if customer is not None:
+        payment_history = db.scalars(
+            select(Payment)
+            .where(Payment.customer_id == customer.id)
+            .order_by(Payment.created_at.desc())
+            .limit(10)
+        ).all()
+        prior_cases = db.scalars(
+            select(RecoveryCase)
+            .where(RecoveryCase.customer_id == customer.id, RecoveryCase.id != case.id)
+            .order_by(RecoveryCase.updated_at.desc())
+            .limit(5)
+        ).all()
     audit_logs = db.scalars(
         select(AuditLog)
         .where(AuditLog.entity_type == "recovery_case", AuditLog.entity_id == case.id)
