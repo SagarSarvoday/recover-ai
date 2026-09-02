@@ -7,7 +7,9 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.config import settings
+from app.core.security import get_current_merchant
 from app.models.customer import Customer
+from app.models.merchant import Merchant
 from app.models.payment import Payment
 from app.models.recovery_case import RecoveryCase
 from app.schemas.recovery_case import RecoveryCaseResponse
@@ -37,17 +39,31 @@ from app.services.recovery_decision import (
 router = APIRouter(tags=["recovery-cases"])
 
 
+def _get_owned_recovery_case(db: Session, case_id: UUID, merchant_id: UUID) -> RecoveryCase:
+    case = db.get(RecoveryCase, case_id)
+    if case is None or case.merchant_id != merchant_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Recovery case not found.",
+        )
+    return case
+
+
 @router.get(
     "/recovery-cases",
     response_model=list[RecoveryCaseResponse],
     summary="List all recovery cases",
 )
-def list_recovery_cases(db: Session = Depends(get_db)) -> list[RecoveryCaseResponse]:
+def list_recovery_cases(
+    db: Session = Depends(get_db),
+    current_merchant: Merchant = Depends(get_current_merchant),
+) -> list[RecoveryCaseResponse]:
     try:
         rows = db.execute(
             select(RecoveryCase, Customer, Payment)
             .outerjoin(Customer, RecoveryCase.customer_id == Customer.id)
             .join(Payment, RecoveryCase.payment_id == Payment.id)
+            .where(RecoveryCase.merchant_id == current_merchant.id)
             .order_by(RecoveryCase.created_at.desc())
         ).all()
     except SQLAlchemyError:
@@ -67,14 +83,13 @@ def list_recovery_cases(db: Session = Depends(get_db)) -> list[RecoveryCaseRespo
     response_model=RecoveryAnalysisResponse,
     summary="Analyze a recovery case with the AI decision engine",
 )
-def analyze_recovery_case(case_id: UUID, db: Session = Depends(get_db)) -> RecoveryAnalysisResponse:
+def analyze_recovery_case(
+    case_id: UUID,
+    db: Session = Depends(get_db),
+    current_merchant: Merchant = Depends(get_current_merchant),
+) -> RecoveryAnalysisResponse:
     try:
-        case = db.get(RecoveryCase, case_id)
-        if case is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Recovery case not found.",
-            )
+        case = _get_owned_recovery_case(db, case_id, current_merchant.id)
 
         customer = db.get(Customer, case.customer_id) if case.customer_id is not None else None
         payment = db.get(Payment, case.payment_id)
@@ -142,20 +157,16 @@ def analyze_recovery_case(case_id: UUID, db: Session = Depends(get_db)) -> Recov
 def execute_recovery_case(
     case_id: UUID,
     db: Session = Depends(get_db),
+    current_merchant: Merchant = Depends(get_current_merchant),
 ) -> RecoveryActionExecutionResponse:
     try:
-        case = db.get(RecoveryCase, case_id)
+        case = _get_owned_recovery_case(db, case_id, current_merchant.id)
     except SQLAlchemyError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Unable to load the recovery case for execution.",
         ) from None
 
-    if case is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Recovery case not found.",
-        )
     if case.ai_decision is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -171,6 +182,7 @@ def execute_recovery_case(
                 max_recovery_attempts=settings.recovery_max_attempts,
                 action_context=RecoveryActionContext(source="ai_recommendation"),
             ),
+            wait_minutes=getattr(case, "ai_wait_minutes", None),
         )
     except InvalidRecoveryActionError:
         raise HTTPException(
@@ -201,11 +213,12 @@ def execute_recovery_case(
 def run_recovery_workflow(
     case_id: UUID,
     db: Session = Depends(get_db),
+    current_merchant: Merchant = Depends(get_current_merchant),
 ) -> RecoveryWorkflowResponse:
 
-    analysis = analyze_recovery_case(case_id, db)
+    analysis = analyze_recovery_case(case_id, db, current_merchant)
 
-    execution = execute_recovery_case(case_id, db)
+    execution = execute_recovery_case(case_id, db, current_merchant)
 
     return RecoveryWorkflowResponse(
         analysis=analysis,

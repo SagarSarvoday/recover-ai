@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal
+from uuid import UUID
 
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import select
@@ -9,9 +10,11 @@ from sqlalchemy.orm import Session
 
 from app.models.audit_log import AuditLog
 from app.models.customer import Customer
+from app.models.merchant import Merchant
 from app.models.payment import Payment
 from app.models.recovery_case import RecoveryCase
 from app.models.razorpay_webhook_event import RazorpayWebhookEvent
+from app.models.transaction import Transaction
 from app.schemas.razorpay import RazorpayWebhookEnvelope
 
 SUPPORTED_RAZORPAY_EVENTS = {"payment.failed", "payment_link.paid"}
@@ -28,6 +31,7 @@ class IncompleteRazorpayPaymentPayloadError(ValueError):
 @dataclass(frozen=True)
 class RazorpayFailedPaymentData:
     payment_id: str
+    order_id: str | None
     customer_id: str | None
     customer_name: str | None
     customer_email: str | None
@@ -35,6 +39,7 @@ class RazorpayFailedPaymentData:
     amount: Decimal
     currency: str
     failure_reason: str
+    payment_method: str | None
 
 
 PLACEHOLDER_EMAILS = {"void@razorpay.com"}
@@ -141,6 +146,7 @@ def extract_failed_payment_data(webhook: RazorpayWebhookEnvelope) -> RazorpayFai
 
     notes = entity.get("notes") if isinstance(entity.get("notes"), dict) else {}
     payment_id = entity.get("id")
+    order_id = _optional_text(entity.get("order_id"))
     customer_id = _optional_text(entity.get("customer_id"))
     customer_email = _usable_email(entity.get("email"))
     customer_name = _optional_text(
@@ -150,6 +156,7 @@ def extract_failed_payment_data(webhook: RazorpayWebhookEnvelope) -> RazorpayFai
     amount = entity.get("amount")
     currency = entity.get("currency")
     failure_reason = _optional_text(entity.get("error_description") or entity.get("error_reason"))
+    payment_method = _optional_text(entity.get("method"))
 
     if not isinstance(payment_id, str) or not payment_id:
         raise IncompleteRazorpayPaymentPayloadError("Missing Razorpay payment identifier.")
@@ -160,6 +167,7 @@ def extract_failed_payment_data(webhook: RazorpayWebhookEnvelope) -> RazorpayFai
 
     return RazorpayFailedPaymentData(
         payment_id=payment_id,
+        order_id=order_id,
         customer_id=customer_id,
         customer_name=customer_name,
         customer_email=customer_email,
@@ -167,6 +175,7 @@ def extract_failed_payment_data(webhook: RazorpayWebhookEnvelope) -> RazorpayFai
         amount=Decimal(amount) / Decimal("100"),
         currency=currency.upper(),
         failure_reason=failure_reason or "Razorpay reported a failed payment.",
+        payment_method=payment_method,
     )
 
 
@@ -198,9 +207,33 @@ def ingest_payment_failed_webhook(
     *,
     razorpay_event_id: str,
     webhook: RazorpayWebhookEnvelope,
-) -> Literal["processed", "duplicate"]:
+) -> Literal["processed", "ignored", "duplicate"]:
     """Atomically ingest one verified payment.failed webhook into RecoverAI."""
     data = extract_failed_payment_data(webhook)
+    merchant = resolve_merchant(db, webhook.account_id)
+    if merchant is None:
+        inserted = record_webhook_event(
+            db,
+            razorpay_event_id=razorpay_event_id,
+            event_type=webhook.event,
+            external_entity_id=data.payment_id,
+            processing_status="ignored",
+        )
+        return "ignored" if inserted else "duplicate"
+
+    payment = db.scalar(
+        select(Payment).where(Payment.razorpay_payment_id == data.payment_id)
+    )
+    if payment is not None and payment.merchant_id != merchant.id:
+        inserted = record_webhook_event(
+            db,
+            razorpay_event_id=razorpay_event_id,
+            event_type=webhook.event,
+            external_entity_id=data.payment_id,
+            processing_status="ignored",
+        )
+        return "ignored" if inserted else "duplicate"
+
     claimed = claim_webhook_event(
         db,
         razorpay_event_id=razorpay_event_id,
@@ -211,33 +244,72 @@ def ingest_payment_failed_webhook(
     if not claimed:
         return "duplicate"
 
-    customer = resolve_customer_identity(db, data)
+    transaction = None
+    if data.order_id:
+        transaction = db.scalar(
+            select(Transaction).where(Transaction.razorpay_order_id == data.order_id)
+        )
+        if transaction is not None and transaction.merchant_id != merchant.id:
+            # A globally unique provider order cannot be reassigned through a webhook.
+            db.rollback()
+            inserted = record_webhook_event(
+                db,
+                razorpay_event_id=razorpay_event_id,
+                event_type=webhook.event,
+                external_entity_id=data.payment_id,
+                processing_status="ignored",
+            )
+            return "ignored" if inserted else "duplicate"
 
-    payment = db.scalar(
-        select(Payment).where(Payment.razorpay_payment_id == data.payment_id)
-    )
+    # A known order is authoritative for merchant/customer ownership. Provider
+    # checkout contact fields are only a fallback for legacy payment-only flows.
+    customer = db.get(Customer, transaction.customer_id) if transaction is not None else resolve_customer_identity(db, merchant.id, data)
+
     if payment is None:
         payment = Payment(
+            merchant_id=merchant.id,
+            transaction_id=transaction.id if transaction is not None else None,
             customer_id=customer.id if customer is not None else None,
             amount=data.amount,
             currency=data.currency,
             status="failed",
             failure_reason=data.failure_reason,
+            payment_method=data.payment_method,
             razorpay_payment_id=data.payment_id,
         )
         db.add(payment)
         db.flush()
     else:
-        if customer is not None:
+        if transaction is not None:
+            if payment.transaction_id not in {None, transaction.id}:
+                db.rollback()
+                inserted = record_webhook_event(
+                    db,
+                    razorpay_event_id=razorpay_event_id,
+                    event_type=webhook.event,
+                    external_entity_id=data.payment_id,
+                    processing_status="ignored",
+                )
+                return "ignored" if inserted else "duplicate"
+            payment.transaction_id = transaction.id
+            payment.customer_id = transaction.customer_id
+        elif customer is not None:
             payment.customer_id = customer.id
         payment.amount = data.amount
         payment.currency = data.currency
         payment.status = "failed"
         payment.failure_reason = data.failure_reason
+        payment.payment_method = data.payment_method
 
-    recovery_case = db.scalar(select(RecoveryCase).where(RecoveryCase.payment_id == payment.id))
+    recovery_case = db.scalar(
+        select(RecoveryCase).where(
+            RecoveryCase.merchant_id == merchant.id,
+            RecoveryCase.payment_id == payment.id,
+        )
+    )
     if recovery_case is None:
         recovery_case = RecoveryCase(
+            merchant_id=payment.merchant_id,
             customer_id=payment.customer_id,
             payment_id=payment.id,
             status="open",
@@ -247,6 +319,8 @@ def ingest_payment_failed_webhook(
         )
         db.add(recovery_case)
         db.flush()
+    elif transaction is not None:
+        recovery_case.customer_id = transaction.customer_id
     elif customer is not None:
         recovery_case.customer_id = customer.id
 
@@ -259,6 +333,8 @@ def ingest_payment_failed_webhook(
             details={
                 "razorpay_event_id": razorpay_event_id,
                 "razorpay_payment_id": data.payment_id,
+                "razorpay_order_id": data.order_id,
+                "transaction_id": str(transaction.id) if transaction is not None else None,
                 "recovery_case_id": str(recovery_case.id),
             },
         )
@@ -269,24 +345,39 @@ def ingest_payment_failed_webhook(
 
 def resolve_customer_identity(
     db: Session,
+    merchant_id: UUID,
     data: RazorpayFailedPaymentData,
 ) -> Customer | None:
     """Resolve only meaningful provider identity; financial ingestion never depends on it."""
     customer = None
     if data.customer_id:
         customer = db.scalar(
-            select(Customer).where(Customer.razorpay_customer_id == data.customer_id)
+            select(Customer).where(
+                Customer.merchant_id == merchant_id,
+                Customer.razorpay_customer_id == data.customer_id,
+            )
         )
     if customer is None and data.customer_email:
-        customer = db.scalar(select(Customer).where(Customer.email == data.customer_email))
+        customer = db.scalar(
+            select(Customer).where(
+                Customer.merchant_id == merchant_id,
+                Customer.email == data.customer_email,
+            )
+        )
     if customer is None and data.customer_contact:
-        customer = db.scalar(select(Customer).where(Customer.phone == data.customer_contact))
+        customer = db.scalar(
+            select(Customer).where(
+                Customer.merchant_id == merchant_id,
+                Customer.phone == data.customer_contact,
+            )
+        )
 
     has_identity = any((data.customer_id, data.customer_email, data.customer_contact))
     if customer is None and not has_identity:
         return None
     if customer is None:
         customer = Customer(
+            merchant_id=merchant_id,
             name=data.customer_name,
             email=data.customer_email,
             phone=data.customer_contact,
@@ -307,6 +398,13 @@ def resolve_customer_identity(
     return customer
 
 
+def resolve_merchant(db: Session, account_id: str | None) -> Merchant | None:
+    """Resolve merchant ownership exclusively from Razorpay's trusted account identifier."""
+    if not account_id:
+        return None
+    return db.scalar(select(Merchant).where(Merchant.razorpay_account_id == account_id))
+
+
 def ingest_payment_link_paid_webhook(
     db: Session,
     *,
@@ -315,8 +413,22 @@ def ingest_payment_link_paid_webhook(
 ) -> Literal["processed", "ignored", "duplicate"]:
     """Atomically settle an existing recovery case for a paid Razorpay payment link."""
     data = extract_paid_payment_link_data(webhook)
+    merchant = resolve_merchant(db, webhook.account_id)
+    if merchant is None:
+        inserted = record_webhook_event(
+            db,
+            razorpay_event_id=razorpay_event_id,
+            event_type=webhook.event,
+            external_entity_id=data.payment_link_id,
+            processing_status="ignored",
+        )
+        return "ignored" if inserted else "duplicate"
+
     recovery_case = db.scalar(
-        select(RecoveryCase).where(RecoveryCase.razorpay_payment_link_id == data.payment_link_id)
+        select(RecoveryCase).where(
+            RecoveryCase.merchant_id == merchant.id,
+            RecoveryCase.razorpay_payment_link_id == data.payment_link_id,
+        )
     )
     if recovery_case is None:
         inserted = record_webhook_event(

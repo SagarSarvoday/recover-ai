@@ -32,6 +32,9 @@ class RecoveryCase(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="RESTRICT"), nullable=False
+    )
     customer_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("customers.id", ondelete="SET NULL")
     )
@@ -48,6 +51,9 @@ class RecoveryCase(Base):
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     ai_decision: Mapped[str | None] = mapped_column(Text)
     ai_decision_note: Mapped[str | None] = mapped_column(Text)
+    ai_wait_minutes: Mapped[int | None] = mapped_column(Integer)
+    next_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    scheduled_action: Mapped[str | None] = mapped_column(Text)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -56,5 +62,6 @@ class RecoveryCase(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
+    merchant: Mapped["Merchant"] = relationship(back_populates="recovery_cases")
     customer: Mapped["Customer | None"] = relationship(back_populates="recovery_cases")
     payment: Mapped["Payment"] = relationship(back_populates="recovery_case")

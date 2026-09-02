@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 RecoveryAction = Literal["retry", "contact", "wait", "skip", "close"]
 
@@ -18,6 +18,15 @@ class RecoveryDecision(BaseModel):
     confidence: float = Field(ge=0, le=1)
     next_step: str = Field(min_length=1, max_length=500)
     stop: bool
+    wait_minutes: int | None = Field(default=None, ge=1, le=10_080)
+
+    @model_validator(mode="after")
+    def validate_wait_timing(self) -> "RecoveryDecision":
+        if self.action == "wait" and self.wait_minutes is None:
+            raise ValueError("WAIT decisions require wait_minutes.")
+        if self.action != "wait" and self.wait_minutes is not None:
+            raise ValueError("wait_minutes is only allowed for WAIT decisions.")
+        return self
 
 
 class PaymentHistoryItem(BaseModel):

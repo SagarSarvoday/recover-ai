@@ -29,6 +29,7 @@ class RecoveryCaseResponse(BaseModel):
     ai_decision: str | None
     ai_reason: str | None
     next_action_at: datetime | None
+    scheduled_action: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -54,7 +55,8 @@ class RecoveryCaseResponse(BaseModel):
             attempt_count=case.attempt_count,
             ai_decision=case.ai_decision,
             ai_reason=case.ai_decision_note,
-            next_action_at=case.last_attempt_at,
+            next_action_at=getattr(case, "next_action_at", None),
+            scheduled_action=getattr(case, "scheduled_action", None),
             created_at=case.created_at,
             updated_at=case.updated_at,
         )

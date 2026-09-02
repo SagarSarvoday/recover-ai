@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Literal
 from uuid import UUID
 from decimal import Decimal
@@ -43,7 +44,7 @@ class SendRecoveryMessageInput(RecoveryToolInput):
 
 
 class ScheduleFollowupInput(RecoveryToolInput):
-    pass
+    wait_minutes: int | None = Field(default=None, ge=1, le=10_080)
 
 
 class StopRecoveryInput(RecoveryToolInput):
@@ -61,6 +62,8 @@ class ActionResult(BaseModel):
     guardrails_applied: list[str] = Field(default_factory=list)
     payment_link_id: str | None = None
     payment_link_url: str | None = None
+    scheduled_at: datetime | None = None
+    scheduled_action: str | None = None
 
 
 class PersistedAIRecommendation(BaseModel):

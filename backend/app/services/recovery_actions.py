@@ -1,8 +1,10 @@
+import logging
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 from uuid import UUID
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -10,6 +12,7 @@ from app.models.audit_log import AuditLog
 from app.models.customer import Customer
 from app.models.payment import Payment
 from app.models.recovery_case import RecoveryCase
+from app.models.scheduled_recovery_action import ScheduledRecoveryAction
 from app.schemas.razorpay import RazorpayPaymentLinkRequest
 from app.schemas.recovery_actions import (
     ActionResult,
@@ -24,6 +27,8 @@ from app.schemas.recovery_actions import (
     StopRecoveryInput,
 )
 from app.services.razorpay_service import RazorpayService
+
+logger = logging.getLogger(__name__)
 
 ACTION_TOOL_MAP: dict[RecoveryRecommendedAction, RecoveryToolAction] = {
     "retry": "retry_payment",
@@ -103,6 +108,13 @@ def _validate_case(
     if payment is None or payment.customer_id != case.customer_id:
         return case, ["required_payment_information_missing"], "Required payment information is missing."
     return case, [], None
+
+
+def _usable_contact_value(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
 
 
 def _execute_simulated_tool(
@@ -333,9 +345,9 @@ def create_payment_link(
         _record_action_attempt(db, result, tool_input.context, execution_context.actor, simulated=False)
         return result
 
-    customer_email = getattr(customer, "email", None)
-    customer_phone = getattr(customer, "phone", None)
-    if not customer_email and not customer_phone:
+    customer_email = _usable_contact_value(getattr(customer, "email", None))
+    customer_phone = _usable_contact_value(getattr(customer, "phone", None))
+    if customer_email is None and customer_phone is None:
         result = ActionResult(
             case_id=case.id,
             action="create_payment_link",
@@ -394,7 +406,12 @@ def create_payment_link(
     razorpay_service = execution_context.razorpay_service or RazorpayService(settings)
     try:
         payment_link = razorpay_service.create_payment_link(request)
-    except Exception:
+    except Exception as error:
+        logger.warning(
+            "Razorpay payment-link creation failed for recovery case %s: exception_type=%s",
+            case.id,
+            type(error).__name__,
+        )
         result = ActionResult(
             case_id=case.id,
             action="create_payment_link",
@@ -409,6 +426,18 @@ def create_payment_link(
         return result
 
     case.razorpay_payment_link_id = payment_link.id
+    case.attempt_count += 1
+    case.last_attempt_at = datetime.now(timezone.utc)
+    case.status = "in_progress"
+    link_message = "Razorpay Test Mode payment link created for the outstanding recovery amount."
+    if payment_link.short_url:
+        link_message = f"{link_message} {payment_link.short_url}"
+    logger.info(
+        "Created Razorpay payment link for recovery case %s: payment_link_id=%s amount_paise=%s",
+        case.id,
+        payment_link.id,
+        amount_in_paise,
+    )
     result = ActionResult(
         case_id=case.id,
         action="create_payment_link",
@@ -416,18 +445,21 @@ def create_payment_link(
         success=True,
         outcome="scheduled",
         amount_recovered=Decimal("0.00"),
-        message="Razorpay Test Mode payment link created for the outstanding recovery amount.",
+        message=link_message,
         guardrails_applied=[],
         payment_link_id=payment_link.id,
         payment_link_url=payment_link.short_url,
     )
+    audit_metadata = {"razorpay_payment_link_id": payment_link.id}
+    if payment_link.short_url:
+        audit_metadata["payment_link_url"] = payment_link.short_url
     _record_action_attempt(
         db,
         result,
         tool_input.context,
         execution_context.actor,
         simulated=False,
-        metadata={"razorpay_payment_link_id": payment_link.id},
+        metadata=audit_metadata,
     )
     return result
 
@@ -449,12 +481,63 @@ def schedule_followup(
     tool_input: ScheduleFollowupInput,
     execution_context: RecoveryActionExecutionContext,
 ) -> ActionResult:
-    return _execute_simulated_tool(
-        tool_input,
-        execution_context,
-        "schedule_followup",
-        "Follow-up scheduling simulated; no follow-up was scheduled.",
+    if tool_input.wait_minutes is None:
+        result = ActionResult(
+            case_id=tool_input.case_id,
+            action="schedule_followup",
+            success=False,
+            outcome="blocked",
+            amount_recovered=Decimal("0.00"),
+            message="WAIT requires validated AI timing before a follow-up can be scheduled.",
+            guardrails_applied=["missing_wait_minutes"],
+        )
+        _record_action_attempt(execution_context.db, result, tool_input.context, execution_context.actor)
+        return result
+
+    db = execution_context.db
+    case, guardrails, blocked_message = _validate_case(
+        db, tool_input.case_id, execution_context.max_recovery_attempts, requires_attempt_capacity=True
     )
+    if blocked_message is not None or case is None:
+        result = ActionResult(
+            case_id=tool_input.case_id, action="schedule_followup", success=False, outcome="blocked",
+            amount_recovered=Decimal("0.00"), message=blocked_message or "Recovery case could not be scheduled.",
+            guardrails_applied=guardrails,
+        )
+        _record_action_attempt(db, result, tool_input.context, execution_context.actor)
+        return result
+
+    scheduled_at = datetime.now(timezone.utc) + timedelta(minutes=tool_input.wait_minutes)
+    existing = None
+    if hasattr(db, "scalar"):
+        existing = db.scalar(
+            select(ScheduledRecoveryAction).where(
+                ScheduledRecoveryAction.recovery_case_id == case.id,
+                ScheduledRecoveryAction.action == "retry",
+                ScheduledRecoveryAction.status.in_(("pending", "running")),
+            )
+        )
+    if existing is None:
+        db.add(ScheduledRecoveryAction(
+            recovery_case_id=case.id,
+            merchant_id=case.merchant_id,
+            action="retry",
+            scheduled_at=scheduled_at,
+            status="pending",
+        ))
+    else:
+        scheduled_at = existing.scheduled_at
+    case.next_action_at = scheduled_at
+    case.scheduled_action = "retry"
+    result = ActionResult(
+        case_id=case.id, action="schedule_followup", status="completed", success=True, outcome="scheduled",
+        amount_recovered=Decimal("0.00"),
+        message="Follow-up retry scheduled from the validated AI wait interval.",
+        guardrails_applied=[], scheduled_at=scheduled_at, scheduled_action="retry",
+    )
+    _record_action_attempt(db, result, tool_input.context, execution_context.actor,
+                           metadata={"wait_minutes": str(tool_input.wait_minutes), "scheduled_action": "retry", "scheduled_at": scheduled_at.isoformat()})
+    return result
 
 
 def stop_recovery(
@@ -480,6 +563,8 @@ def execute_recovery_action(
     action: str,
     case_id: UUID,
     context: RecoveryActionExecutionContext,
+    *,
+    wait_minutes: int | None = None,
 ) -> ActionResult:
     """Dispatch a bounded recovery recommendation to one deterministic tool only."""
     if action not in ACTION_TOOL_MAP:
@@ -494,6 +579,6 @@ def execute_recovery_action(
         )
     if tool_action == "schedule_followup":
         return schedule_followup(
-            ScheduleFollowupInput(case_id=case_id, context=context.action_context), context
+            ScheduleFollowupInput(case_id=case_id, context=context.action_context, wait_minutes=wait_minutes), context
         )
     return stop_recovery(StopRecoveryInput(case_id=case_id, context=context.action_context), context)

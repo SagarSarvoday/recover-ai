@@ -26,6 +26,24 @@ class RazorpayPaymentLinkResult(BaseModel):
     raw_response: dict[str, Any]
 
 
+class RazorpayOrderRequest(BaseModel):
+    """Server-side request for a Razorpay order; amount is in paise."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    amount: int = Field(gt=0)
+    currency: str = Field(default="INR", min_length=3, max_length=3)
+    receipt: str = Field(min_length=1, max_length=40)
+
+
+class RazorpayOrderResult(BaseModel):
+    id: str
+    amount: int
+    currency: str
+    status: str | None = None
+    raw_response: dict[str, Any]
+
+
 class RazorpayWebhookEnvelope(BaseModel):
     """Validated top-level structure for a Razorpay webhook payload."""
 
@@ -33,6 +51,7 @@ class RazorpayWebhookEnvelope(BaseModel):
 
     event: str = Field(min_length=1, max_length=100)
     payload: dict[str, Any]
+    account_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class RazorpayWebhookResponse(BaseModel):

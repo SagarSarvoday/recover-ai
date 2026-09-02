@@ -67,8 +67,11 @@ async def receive_razorpay_webhook(
     try:
         payload = json.loads(raw_body)
 
-        webhook = RazorpayWebhookEnvelope.model_validate(payload)
+        print("\n========== RAZORPAY WEBHOOK PAYLOAD ==========")
+        print(json.dumps(payload, indent=2))
+        print("===============================================\n")
 
+        webhook = RazorpayWebhookEnvelope.model_validate(payload)
         external_entity_id = extract_external_entity_id(webhook)
 
     except (json.JSONDecodeError, ValidationError, InvalidRazorpayWebhookPayloadError):
@@ -84,16 +87,10 @@ async def receive_razorpay_webhook(
                 razorpay_event_id=event_id,
                 webhook=webhook,
             )
-            if processing_status == "duplicate":
-                return RazorpayWebhookResponse(
-                    event_id=event_id,
-                    event_type=webhook.event,
-                    status="duplicate",
-                )
             return RazorpayWebhookResponse(
                 event_id=event_id,
                 event_type=webhook.event,
-                status="processed",
+                status=processing_status,
             )
         if webhook.event == "payment_link.paid":
             processing_status = ingest_payment_link_paid_webhook(

@@ -1,0 +1,12 @@
+.page { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at top right, #dff7ef, transparent 34%), #f7f8fa; }
+.card { width: min(100%, 480px); padding: 38px; border: 1px solid #e2e8ea; border-radius: 16px; background: #fff; box-shadow: 0 16px 50px rgba(16, 24, 40, .08); }
+.eyebrow { margin: 0; color: #0d926e; font: 700 12px "DM Mono", monospace; letter-spacing: .14em; text-transform: uppercase; }
+.card h1 { margin: 24px 0 10px; color: #172033; font-size: 30px; letter-spacing: -1.4px; }
+.description, .helper { margin: 0; color: #697386; font-size: 14px; line-height: 1.65; }
+.payButton { width: 100%; margin-top: 28px; padding: 12px 16px; border: 0; border-radius: 8px; cursor: pointer; background: #0d926e; color: #fff; font: inherit; font-size: 13px; font-weight: 800; }
+.payButton:hover { background: #087858; }
+.payButton:disabled { cursor: default; opacity: .65; }
+.helper { margin-top: 12px; font-size: 12px; }
+.success, .failure { overflow-x: auto; margin: 22px 0 0; padding: 14px; border-radius: 8px; font: 12px/1.55 "DM Mono", monospace; white-space: pre-wrap; word-break: break-word; }
+.success { color: #087858; background: #edf9f4; }
+.failure { color: #a4334a; background: #fff0f2; }

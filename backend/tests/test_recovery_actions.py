@@ -107,7 +107,7 @@ class RecoveryActionTests(unittest.TestCase):
     def test_action_is_blocked_for_recovered_case(self) -> None:
         self.case.status = "recovered"
 
-        result = execute_recovery_action("wait", self.case_id, self.context)
+        result = execute_recovery_action("wait", self.case_id, self.context, wait_minutes=60)
 
         self.assertFalse(result.success)
         self.assertIn("case_already_recovered", result.guardrails_applied)
@@ -115,13 +115,16 @@ class RecoveryActionTests(unittest.TestCase):
     def test_action_is_blocked_for_closed_case(self) -> None:
         self.case.status = "closed"
 
-        result = execute_recovery_action("wait", self.case_id, self.context)
+        result = execute_recovery_action("wait", self.case_id, self.context, wait_minutes=60)
 
         self.assertFalse(result.success)
         self.assertIn("case_already_closed", result.guardrails_applied)
 
     def test_wait_schedules_followup(self) -> None:
-        result = execute_recovery_action("wait", self.case_id, self.context)
+        self.case.merchant_id = uuid4()
+        self.case.next_action_at = None
+        self.case.scheduled_action = None
+        result = execute_recovery_action("wait", self.case_id, self.context, wait_minutes=60)
 
         self.assertTrue(result.success)
         self.assertEqual(result.action, "schedule_followup")
@@ -157,6 +160,10 @@ class RecoveryActionTests(unittest.TestCase):
         self.assertEqual(request.amount, 49900)  # type: ignore[attr-defined]
         self.assertEqual(request.currency, "INR")  # type: ignore[attr-defined]
         self.assertEqual(request.customer_email, "customer@example.com")  # type: ignore[attr-defined]
+        self.assertEqual(self.case.attempt_count, 1)
+        self.assertEqual(self.case.status, "in_progress")
+        self.assertIsNotNone(self.case.last_attempt_at)
+        self.assertEqual(self.db.audit_logs[0].details["simulated"], False)
 
     def test_contact_uses_only_outstanding_amount_in_paise(self) -> None:
         self.case.amount_recovered = Decimal("149.00")
@@ -185,6 +192,8 @@ class RecoveryActionTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.payment_link_id, "plink_existing")
         self.assertEqual(razorpay_service.requests, [])
+        self.assertEqual(self.case.attempt_count, 0)
+        self.assertEqual(self.case.status, "open")
 
     def test_razorpay_failure_does_not_persist_a_payment_link(self) -> None:
         razorpay_service = FakeRazorpayService(error=RuntimeError("provider unavailable"))
@@ -232,6 +241,55 @@ class RecoveryActionTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("required_customer_information_missing", result.guardrails_applied)
         self.assertEqual(razorpay_service.requests, [])
+
+    def test_contact_without_email_and_phone_is_blocked_without_provider_call(self) -> None:
+        self.customer.email = None
+        self.customer.phone = None
+        razorpay_service = FakeRazorpayService()
+        context = RecoveryActionExecutionContext(
+            db=self.db,
+            max_recovery_attempts=3,
+            razorpay_service=razorpay_service,  # type: ignore[arg-type]
+        )
+
+        result = execute_recovery_action("contact", self.case_id, context)
+
+        self.assertFalse(result.success)
+        self.assertIn("customer_contact_information_missing", result.guardrails_applied)
+        self.assertEqual(razorpay_service.requests, [])
+        self.assertIsNone(self.case.razorpay_payment_link_id)
+        self.assertEqual(self.case.attempt_count, 0)
+
+    def test_blank_email_and_phone_are_treated_as_missing_contact(self) -> None:
+        self.customer.email = "   "
+        self.customer.phone = ""
+        razorpay_service = FakeRazorpayService()
+        context = RecoveryActionExecutionContext(
+            db=self.db,
+            max_recovery_attempts=3,
+            razorpay_service=razorpay_service,  # type: ignore[arg-type]
+        )
+
+        result = execute_recovery_action("contact", self.case_id, context)
+
+        self.assertFalse(result.success)
+        self.assertIn("customer_contact_information_missing", result.guardrails_applied)
+        self.assertEqual(razorpay_service.requests, [])
+
+    def test_contact_succeeds_with_phone_only(self) -> None:
+        self.customer.email = None
+        razorpay_service = FakeRazorpayService()
+        context = RecoveryActionExecutionContext(
+            db=self.db,
+            max_recovery_attempts=3,
+            razorpay_service=razorpay_service,  # type: ignore[arg-type]
+        )
+
+        result = execute_recovery_action("contact", self.case_id, context)
+
+        self.assertTrue(result.success)
+        self.assertEqual(razorpay_service.requests[0].customer_email, None)  # type: ignore[attr-defined]
+        self.assertEqual(razorpay_service.requests[0].customer_contact, "9876543210")  # type: ignore[attr-defined]
 
 
 if __name__ == "__main__":

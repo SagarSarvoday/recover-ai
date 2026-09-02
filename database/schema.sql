@@ -1,19 +1,74 @@
 -- RecoverAI — PostgreSQL schema (hackathon MVP)
--- Tables: customers, payments, recovery_cases, audit_logs, razorpay_webhook_events
+-- Tables: merchants, customers, payments, recovery_cases, audit_logs, razorpay_webhook_events
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- ---------------------------------------------------------------------------
+-- merchants
+-- Merchant ownership is mandatory for all customer, payment, and recovery data.
+-- password_hash stays nullable until merchant authentication/onboarding is added.
+-- ---------------------------------------------------------------------------
+CREATE TABLE merchants (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                TEXT NOT NULL,
+    email               TEXT NOT NULL UNIQUE,
+    password_hash       TEXT,
+    razorpay_account_id TEXT UNIQUE,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Compatibility merchant for the existing single-merchant development workflow.
+INSERT INTO merchants (id, name, email, razorpay_account_id)
+VALUES (
+    '00000000-0000-0000-0000-000000000001',
+    'RecoverAI Legacy Development Merchant',
+    'legacy@recoverai.local',
+    'acc_TTZWM0fniZWAbi'
+)
+ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- customers
 -- ---------------------------------------------------------------------------
 CREATE TABLE customers (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id   UUID NOT NULL REFERENCES merchants (id) ON DELETE RESTRICT,
     name          TEXT,
-    email         TEXT UNIQUE,
+    email         TEXT,
     phone         TEXT,
-    razorpay_customer_id TEXT UNIQUE,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    razorpay_customer_id TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT customers_merchant_email_key UNIQUE (merchant_id, email),
+    CONSTRAINT customers_merchant_razorpay_customer_id_key
+        UNIQUE (merchant_id, razorpay_customer_id)
 );
+
+CREATE INDEX idx_customers_merchant_id ON customers (merchant_id);
+
+-- ---------------------------------------------------------------------------
+-- transactions
+-- Merchant business payment intents. A transaction can have multiple Razorpay
+-- payment attempts; existing historical payment rows may remain unlinked.
+-- ---------------------------------------------------------------------------
+CREATE TABLE transactions (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id             UUID NOT NULL REFERENCES merchants (id) ON DELETE RESTRICT,
+    customer_id             UUID NOT NULL REFERENCES customers (id) ON DELETE RESTRICT,
+    merchant_transaction_id TEXT NOT NULL,
+    razorpay_order_id       TEXT UNIQUE,
+    amount                  NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+    currency                TEXT NOT NULL DEFAULT 'INR',
+    status                  TEXT NOT NULL DEFAULT 'created'
+                            CHECK (status IN ('created', 'pending', 'paid', 'cancelled')),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT transactions_merchant_external_key
+        UNIQUE (merchant_id, merchant_transaction_id)
+);
+
+CREATE INDEX idx_transactions_merchant_id ON transactions (merchant_id);
+CREATE INDEX idx_transactions_customer_id ON transactions (customer_id);
 
 -- ---------------------------------------------------------------------------
 -- payments
@@ -23,11 +78,14 @@ CREATE TABLE customers (
 -- ---------------------------------------------------------------------------
 CREATE TABLE payments (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id     UUID NOT NULL REFERENCES merchants (id) ON DELETE RESTRICT,
+    transaction_id  UUID REFERENCES transactions (id) ON DELETE SET NULL,
     customer_id     UUID REFERENCES customers (id) ON DELETE SET NULL,
     amount          NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
     currency        TEXT NOT NULL DEFAULT 'INR',
     status          TEXT NOT NULL CHECK (status IN ('pending', 'succeeded', 'failed')),
     failure_reason  TEXT,
+    payment_method  TEXT,
     razorpay_payment_id TEXT UNIQUE,
     razorpay_success_payment_id TEXT UNIQUE,
     paid_at         TIMESTAMPTZ,
@@ -40,6 +98,8 @@ CREATE TABLE payments (
 );
 
 CREATE INDEX idx_payments_customer_id ON payments (customer_id);
+CREATE INDEX idx_payments_merchant_id ON payments (merchant_id);
+CREATE INDEX idx_payments_transaction_id ON payments (transaction_id);
 CREATE INDEX idx_payments_status ON payments (status);
 CREATE INDEX idx_payments_razorpay_payment_id ON payments (razorpay_payment_id);
 CREATE INDEX idx_payments_razorpay_success_payment_id ON payments (razorpay_success_payment_id);
@@ -54,6 +114,7 @@ CREATE INDEX idx_payments_razorpay_success_payment_id ON payments (razorpay_succ
 -- ---------------------------------------------------------------------------
 CREATE TABLE recovery_cases (
     id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id       UUID NOT NULL REFERENCES merchants (id) ON DELETE RESTRICT,
     customer_id       UUID REFERENCES customers (id) ON DELETE SET NULL,
     payment_id        UUID NOT NULL UNIQUE REFERENCES payments (id) ON DELETE CASCADE,
     razorpay_payment_link_id TEXT UNIQUE,
@@ -67,6 +128,9 @@ CREATE TABLE recovery_cases (
                           OR ai_decision IN ('retry', 'wait', 'contact', 'skip', 'close')
                       ),
     ai_decision_note  TEXT,
+    ai_wait_minutes   INTEGER CHECK (ai_wait_minutes IS NULL OR ai_wait_minutes BETWEEN 1 AND 10080),
+    next_action_at    TIMESTAMPTZ,
+    scheduled_action  TEXT,
     last_attempt_at   TIMESTAMPTZ,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -77,9 +141,38 @@ CREATE TABLE recovery_cases (
 );
 
 CREATE INDEX idx_recovery_cases_customer_id ON recovery_cases (customer_id);
+CREATE INDEX idx_recovery_cases_merchant_id ON recovery_cases (merchant_id);
 CREATE INDEX idx_recovery_cases_status ON recovery_cases (status);
 CREATE INDEX idx_recovery_cases_razorpay_payment_link_id
     ON recovery_cases (razorpay_payment_link_id);
+
+-- ---------------------------------------------------------------------------
+-- scheduled_recovery_actions
+-- Durable delayed actions, claimed with row locks by the in-process worker.
+-- ---------------------------------------------------------------------------
+CREATE TABLE scheduled_recovery_actions (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    recovery_case_id  UUID NOT NULL REFERENCES recovery_cases(id) ON DELETE CASCADE,
+    merchant_id       UUID NOT NULL REFERENCES merchants(id) ON DELETE RESTRICT,
+    action            TEXT NOT NULL CHECK (action IN ('retry', 'contact')),
+    scheduled_at      TIMESTAMPTZ NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending', 'running', 'completed', 'skipped', 'failed')),
+    attempt_count     INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    error_message     TEXT,
+    lease_expires_at  TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    executed_at       TIMESTAMPTZ,
+    CONSTRAINT scheduled_recovery_actions_case_action_time_key
+        UNIQUE (recovery_case_id, action, scheduled_at)
+);
+
+CREATE INDEX idx_scheduled_recovery_actions_due
+    ON scheduled_recovery_actions (status, scheduled_at);
+
+CREATE UNIQUE INDEX scheduled_recovery_actions_one_active_case_action_key
+    ON scheduled_recovery_actions (recovery_case_id, action)
+    WHERE status IN ('pending', 'running');
 
 -- ---------------------------------------------------------------------------
 -- audit_logs

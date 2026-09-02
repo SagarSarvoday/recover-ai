@@ -36,12 +36,14 @@ class RecoveryExecutionEndpointTests(unittest.TestCase):
     def setUp(self) -> None:
         self.case_id = uuid4()
         self.customer_id = uuid4()
+        self.merchant_id = uuid4()
         self.payment_id = uuid4()
         self.case = SimpleNamespace(
             amount_at_risk=Decimal("499.00"),
             amount_recovered=Decimal("0.00"),
             last_attempt_at=None,
             id=self.case_id,
+            merchant_id=self.merchant_id,
             customer_id=self.customer_id,
             payment_id=self.payment_id,
             status="open",
@@ -58,10 +60,11 @@ class RecoveryExecutionEndpointTests(unittest.TestCase):
         status="failed",
     )
         self.db = FakeSession(self.case, self.payment)
+        self.merchant = SimpleNamespace(id=self.merchant_id)
 
     def execute_persisted_decision(self, action: str):
         self.case.ai_decision = action
-        return execute_recovery_case(self.case_id, self.db)
+        return execute_recovery_case(self.case_id, self.db, self.merchant)
 
     def test_analyzed_retry_executes_retry_tool(self) -> None:
         response = self.execute_persisted_decision("retry")
@@ -80,6 +83,7 @@ class RecoveryExecutionEndpointTests(unittest.TestCase):
         self.assertTrue(response.action_execution_result.success)
 
     def test_analyzed_wait_executes_followup_tool(self) -> None:
+        self.case.ai_wait_minutes = 60
         response = self.execute_persisted_decision("wait")
 
         self.assertEqual(response.action_execution_result.action, "schedule_followup")
@@ -96,7 +100,7 @@ class RecoveryExecutionEndpointTests(unittest.TestCase):
         self.case.ai_decision = None
 
         with self.assertRaises(HTTPException) as error:
-            execute_recovery_case(self.case_id, self.db)
+            execute_recovery_case(self.case_id, self.db, self.merchant)
 
         self.assertEqual(error.exception.status_code, 400)
 
@@ -126,7 +130,7 @@ class RecoveryExecutionEndpointTests(unittest.TestCase):
         self.case.ai_decision = "arbitrary_function"
 
         with self.assertRaises(HTTPException) as error:
-            execute_recovery_case(self.case_id, self.db)
+            execute_recovery_case(self.case_id, self.db, self.merchant)
 
         self.assertEqual(error.exception.status_code, 409)
 

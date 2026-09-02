@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -12,6 +12,7 @@ from app.models.audit_log import AuditLog
 from app.models.customer import Customer
 from app.models.payment import Payment
 from app.models.recovery_case import RecoveryCase
+from app.models.scheduled_recovery_action import ScheduledRecoveryAction
 from app.schemas.recovery_analysis import (
     PaymentHistoryItem,
     PreviousRecoveryOutcome,
@@ -27,14 +28,14 @@ Consider the complete supplied context: current payment, revenue at risk, paymen
 ACTION_NEXT_STEPS = {
     "retry": "Retry the payment once",
     "contact": "Contact the customer with a payment link",
-    "wait": "Wait 24 hours, then reassess",
+    "wait": "Wait for the validated interval, then perform one controlled retry",
     "skip": "Do not initiate recovery",
     "close": "Stop recovery",
 }
 
 SYSTEM_PROMPT += """
 
-Your `next_step` must be semantically consistent with your selected `action`. Use these action-aligned next steps: retry = \"Retry the payment once\"; contact = \"Contact the customer with a payment link\"; wait = \"Wait 24 hours, then reassess\"; skip = \"Do not initiate recovery\"; close = \"Stop recovery\". In particular, never describe a retry as the next step when the action is wait."""
+Your `next_step` must be semantically consistent with your selected `action`. Use these action-aligned next steps: retry = \"Retry the payment once\"; contact = \"Contact the customer with a payment link\"; wait = \"Wait for the validated interval, then perform one controlled retry\"; skip = \"Do not initiate recovery\"; close = \"Stop recovery\". For action `wait`, you MUST provide an integer `wait_minutes` between 1 and 10080. The scheduled follow-up is one controlled retry; do not return wait_minutes for any other action."""
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +260,8 @@ def persist_analysis(
     analyzed_at = datetime.now(timezone.utc)
     case.ai_decision = decision.action
     case.ai_decision_note = decision.reason
+    case.ai_wait_minutes = decision.wait_minutes
+    _sync_wait_followup_schedule(db, case, decision, analyzed_at)
     db.add(
         AuditLog(
             entity_type="recovery_case",
@@ -272,6 +275,7 @@ def persist_analysis(
                 "confidence": decision.confidence,
                 "next_step": decision.next_step,
                 "stop": decision.stop,
+                "wait_minutes": decision.wait_minutes,
                 "guardrails_applied": guardrails_applied,
                 "model": model,
                 "analyzed_at": analyzed_at.isoformat(),
@@ -280,3 +284,53 @@ def persist_analysis(
     )
     db.commit()
     return analyzed_at
+
+
+def _sync_wait_followup_schedule(
+    db: Session,
+    case: RecoveryCase,
+    decision: RecoveryDecision,
+    analyzed_at: datetime,
+) -> None:
+    """Keep the durable WAIT retry, and its case summary fields, in one transaction."""
+    existing_job = db.scalar(
+        select(ScheduledRecoveryAction).where(
+            ScheduledRecoveryAction.recovery_case_id == case.id,
+            ScheduledRecoveryAction.action == "retry",
+            ScheduledRecoveryAction.status.in_(("pending", "running")),
+        )
+    )
+
+    if decision.action != "wait":
+        if existing_job is not None:
+            existing_job.status = "skipped"
+            existing_job.executed_at = analyzed_at
+            existing_job.lease_expires_at = None
+            existing_job.error_message = "Superseded by a later guarded AI analysis."
+        case.next_action_at = None
+        case.scheduled_action = None
+        return
+
+    wait_minutes = decision.wait_minutes
+    # RecoveryDecision validates this already. Keep the persistence boundary defensive
+    # so a caller cannot schedule an unvalidated value by constructing a model manually.
+    if isinstance(wait_minutes, bool) or not isinstance(wait_minutes, int) or not 1 <= wait_minutes <= 10_080:
+        raise ValueError("WAIT decisions require a validated wait_minutes value between 1 and 10080.")
+
+    if existing_job is None:
+        scheduled_at = analyzed_at + timedelta(minutes=wait_minutes)
+        db.add(
+            ScheduledRecoveryAction(
+                recovery_case_id=case.id,
+                merchant_id=case.merchant_id,
+                action="retry",
+                scheduled_at=scheduled_at,
+                status="pending",
+            )
+        )
+    else:
+        # Re-analysis is idempotent: keep the original active job and its due time.
+        scheduled_at = existing_job.scheduled_at
+
+    case.next_action_at = scheduled_at
+    case.scheduled_action = "retry"

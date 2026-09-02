@@ -3,7 +3,12 @@ import hmac
 from typing import Any, Protocol
 
 from app.core.config import Settings
-from app.schemas.razorpay import RazorpayPaymentLinkRequest, RazorpayPaymentLinkResult
+from app.schemas.razorpay import (
+    RazorpayOrderRequest,
+    RazorpayOrderResult,
+    RazorpayPaymentLinkRequest,
+    RazorpayPaymentLinkResult,
+)
 
 
 class RazorpayConfigurationError(RuntimeError):
@@ -11,13 +16,17 @@ class RazorpayConfigurationError(RuntimeError):
 
 
 class RazorpayClientProtocol(Protocol):
+    class order:  # type: ignore[valid-type]
+        @staticmethod
+        def create(payload: dict[str, Any]) -> dict[str, Any]: ...
+
     class payment_link:  # type: ignore[valid-type]
         @staticmethod
         def create(payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class RazorpayService:
-    """Isolated Razorpay Test Mode client. No routes or recovery tools call it yet."""
+    """Razorpay Test Mode client used by webhook verification and recovery payment links."""
 
     def __init__(self, settings: Settings, client: RazorpayClientProtocol | None = None) -> None:
         self._settings = settings
@@ -63,6 +72,16 @@ class RazorpayService:
         }
         if customer:
             payload["customer"] = customer
+        notify = {
+            key: True
+            for key, enabled in {
+                "email": request.customer_email is not None,
+                "sms": request.customer_contact is not None,
+            }.items()
+            if enabled
+        }
+        if notify:
+            payload["notify"] = notify
 
         response = self._get_client().payment_link.create(payload)
         return RazorpayPaymentLinkResult(
@@ -71,6 +90,22 @@ class RazorpayService:
             status=response.get("status"),
             amount=response.get("amount", request.amount),
             currency=response.get("currency", payload["currency"]),
+            raw_response=response,
+        )
+
+    def create_order(self, request: RazorpayOrderRequest) -> RazorpayOrderResult:
+        """Create a merchant transaction's Razorpay order from the backend only."""
+        payload = {
+            "amount": request.amount,
+            "currency": request.currency.upper(),
+            "receipt": request.receipt,
+        }
+        response = self._get_client().order.create(payload)
+        return RazorpayOrderResult(
+            id=response["id"],
+            amount=response.get("amount", request.amount),
+            currency=response.get("currency", payload["currency"]),
+            status=response.get("status"),
             raw_response=response,
         )
 

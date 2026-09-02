@@ -5,11 +5,19 @@ import unittest
 from pydantic import SecretStr
 
 from app.core.config import Settings
-from app.schemas.razorpay import RazorpayPaymentLinkRequest
+from app.schemas.razorpay import RazorpayOrderRequest, RazorpayPaymentLinkRequest
 from app.services.razorpay_service import RazorpayConfigurationError, RazorpayService
 
 
 class FakePaymentLinkClient:
+    class order:
+        received_payload: dict | None = None
+
+        @classmethod
+        def create(cls, payload: dict) -> dict:
+            cls.received_payload = payload
+            return {"id": "order_test_123", "amount": payload["amount"], "currency": payload["currency"], "status": "created"}
+
     class payment_link:
         received_payload: dict | None = None
 
@@ -51,6 +59,36 @@ class RazorpayServiceTests(unittest.TestCase):
         self.assertEqual(result.id, "plink_test_123")
         self.assertEqual(result.amount, 50000)
         self.assertEqual(FakePaymentLinkClient.payment_link.received_payload["currency"], "INR")
+        self.assertEqual(
+            FakePaymentLinkClient.payment_link.received_payload["notify"],
+            {"email": True},
+        )
+
+    def test_enables_email_and_sms_notify_when_both_contacts_are_present(self) -> None:
+        FakePaymentLinkClient.payment_link.received_payload = None
+        service = RazorpayService(build_settings(), FakePaymentLinkClient())
+
+        service.create_payment_link(
+            RazorpayPaymentLinkRequest(
+                amount=100,
+                customer_email="customer@example.com",
+                customer_contact="+919876543210",
+            )
+        )
+
+        self.assertEqual(
+            FakePaymentLinkClient.payment_link.received_payload["notify"],
+            {"email": True, "sms": True},
+        )
+
+    def test_creates_a_typed_order_with_injected_client(self) -> None:
+        service = RazorpayService(build_settings(), FakePaymentLinkClient())
+
+        result = service.create_order(RazorpayOrderRequest(amount=199900, currency="INR", receipt="ORDER_123"))
+
+        self.assertEqual(result.id, "order_test_123")
+        self.assertEqual(result.amount, 199900)
+        self.assertEqual(FakePaymentLinkClient.order.received_payload, {"amount": 199900, "currency": "INR", "receipt": "ORDER_123"})
 
     def test_verifies_valid_raw_webhook_body_signature(self) -> None:
         raw_body = b'{"event":"payment_link.paid"}'

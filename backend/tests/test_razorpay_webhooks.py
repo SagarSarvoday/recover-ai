@@ -11,8 +11,10 @@ from starlette.requests import Request
 from app.api.v1.webhooks import receive_razorpay_webhook
 from app.models.audit_log import AuditLog
 from app.models.customer import Customer
+from app.models.merchant import Merchant
 from app.models.payment import Payment
 from app.models.recovery_case import RecoveryCase
+from app.models.transaction import Transaction
 
 
 class FakeRazorpayService:
@@ -38,7 +40,16 @@ class FakeSession:
         self.event_ids: set[str] = set()
         self.pending_event_ids: set[str] = set()
         self.customers: list[Customer] = []
+        self.merchants: list[Merchant] = [
+            Merchant(
+                id=uuid4(),
+                name="Legacy Merchant",
+                email="legacy@recoverai.local",
+                razorpay_account_id="acc_TTZWM0fniZWAbi",
+            )
+        ]
         self.payments: list[Payment] = []
+        self.transactions: list[Transaction] = []
         self.recovery_cases: list[RecoveryCase] = []
         self.audit_logs: list[AuditLog] = []
         self.commits = 0
@@ -53,12 +64,17 @@ class FakeSession:
     def scalar(self, statement: object):
         entity = statement.column_descriptions[0]["entity"]
         values = set(statement.compile().params.values())
+        if entity is Merchant:
+            return next(
+                (merchant for merchant in self.merchants if merchant.razorpay_account_id in values),
+                None,
+            )
         if entity is Customer:
             return next(
                 (
                     customer
                     for customer in self.customers
-                    if (
+                    if customer.merchant_id in values and (
                         customer.razorpay_customer_id in values
                         or customer.email in values
                         or customer.phone in values
@@ -71,18 +87,26 @@ class FakeSession:
                 (payment for payment in self.payments if payment.razorpay_payment_id in values),
                 None,
             )
+        if entity is Transaction:
+            return next(
+                (transaction for transaction in self.transactions if transaction.razorpay_order_id in values),
+                None,
+            )
         if entity is RecoveryCase:
             return next(
                 (
                     case
                     for case in self.recovery_cases
-                    if case.payment_id in values or case.razorpay_payment_link_id in values
+                    if case.merchant_id in values
+                    and (case.payment_id in values or case.razorpay_payment_link_id in values)
                 ),
                 None,
             )
         return None
 
     def get(self, model: object, object_id: object):
+        if model is Customer:
+            return next((customer for customer in self.customers if customer.id == object_id), None)
         if model is Payment:
             return next((payment for payment in self.payments if payment.id == object_id), None)
         return None
@@ -99,6 +123,20 @@ class FakeSession:
             self.recovery_cases.append(item)
         elif isinstance(item, AuditLog):
             self.audit_logs.append(item)
+
+    @property
+    def legacy_merchant(self) -> Merchant:
+        return self.merchants[0]
+
+    def add_merchant(self, account_id: str) -> Merchant:
+        merchant = Merchant(
+            id=uuid4(),
+            name=f"Merchant {len(self.merchants) + 1}",
+            email=f"merchant-{len(self.merchants) + 1}@example.com",
+            razorpay_account_id=account_id,
+        )
+        self.merchants.append(merchant)
+        return merchant
 
     def flush(self) -> None:
         pass
@@ -125,6 +163,7 @@ def webhook_body(event: str) -> bytes:
     if event == "payment.failed":
         payload = {
             "event": event,
+            "account_id": "acc_TTZWM0fniZWAbi",
             "payload": {
                 "payment": {
                     "entity": {
@@ -143,6 +182,7 @@ def webhook_body(event: str) -> bytes:
     elif event == "payment_link.paid":
         payload = {
             "event": event,
+            "account_id": "acc_TTZWM0fniZWAbi",
             "payload": {
                 "payment_link": {"entity": {"id": "plink_test_1"}},
                 "payment": {"entity": {"id": "pay_success_1", "amount": 50000}},
@@ -173,6 +213,9 @@ class RazorpayWebhookTests(unittest.TestCase):
         self.assertEqual(len(self.db.recovery_cases), 1)
         self.assertEqual(self.db.payments[0].razorpay_payment_id, "pay_test_1")
         self.assertEqual(str(self.db.payments[0].amount), "500")
+        self.assertEqual(self.db.customers[0].merchant_id, self.db.legacy_merchant.id)
+        self.assertEqual(self.db.payments[0].merchant_id, self.db.legacy_merchant.id)
+        self.assertEqual(self.db.recovery_cases[0].merchant_id, self.db.legacy_merchant.id)
 
     def create_mapped_recovery_case(self) -> None:
         self.post(
@@ -251,6 +294,7 @@ class RazorpayWebhookTests(unittest.TestCase):
     def test_phone_only_identity_creates_a_partial_customer(self) -> None:
         payload = {
             "event": "payment.failed",
+            "account_id": "acc_TTZWM0fniZWAbi",
             "payload": {
                 "payment": {
                     "entity": {
@@ -276,6 +320,73 @@ class RazorpayWebhookTests(unittest.TestCase):
         self.assertEqual(self.db.payments[0].customer_id, self.db.customers[0].id)
         self.assertEqual(self.db.recovery_cases[0].customer_id, self.db.customers[0].id)
 
+    def test_unknown_account_is_ignored_without_creating_records(self) -> None:
+        payload = json.loads(webhook_body("payment.failed"))
+        payload["account_id"] = "acc_unknown"
+
+        response = self.post(
+            json.dumps(payload).encode(),
+            {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_unknown_account"},
+        )
+
+        self.assertEqual(response.status, "ignored")
+        self.assertEqual(len(self.db.customers), 0)
+        self.assertEqual(len(self.db.payments), 0)
+        self.assertEqual(len(self.db.recovery_cases), 0)
+
+    def test_two_merchants_receive_isolated_payments_and_recovery_cases(self) -> None:
+        second_merchant = self.db.add_merchant("acc_second_merchant")
+        first_payload = json.loads(webhook_body("payment.failed"))
+        first_payload["payload"]["payment"]["entity"]["id"] = "pay_merchant_one"
+        second_payload = json.loads(webhook_body("payment.failed"))
+        second_payload["account_id"] = "acc_second_merchant"
+        second_payload["payload"]["payment"]["entity"]["id"] = "pay_merchant_two"
+
+        first = self.post(
+            json.dumps(first_payload).encode(),
+            {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_merchant_one"},
+        )
+        second = self.post(
+            json.dumps(second_payload).encode(),
+            {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_merchant_two"},
+        )
+
+        self.assertEqual(first.status, "processed")
+        self.assertEqual(second.status, "processed")
+        self.assertEqual(len(self.db.customers), 2)
+        self.assertEqual({customer.merchant_id for customer in self.db.customers}, {
+            self.db.legacy_merchant.id,
+            second_merchant.id,
+        })
+        self.assertEqual({payment.merchant_id for payment in self.db.payments}, {
+            self.db.legacy_merchant.id,
+            second_merchant.id,
+        })
+        self.assertEqual({case.merchant_id for case in self.db.recovery_cases}, {
+            self.db.legacy_merchant.id,
+            second_merchant.id,
+        })
+
+    def test_existing_payment_cannot_be_reassigned_to_another_merchant(self) -> None:
+        second_merchant = self.db.add_merchant("acc_second_merchant")
+        first = self.post(
+            webhook_body("payment.failed"),
+            {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_original_owner"},
+        )
+        conflicting_payload = json.loads(webhook_body("payment.failed"))
+        conflicting_payload["account_id"] = "acc_second_merchant"
+        conflicting = self.post(
+            json.dumps(conflicting_payload).encode(),
+            {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_conflicting_owner"},
+        )
+
+        self.assertEqual(first.status, "processed")
+        self.assertEqual(conflicting.status, "ignored")
+        self.assertEqual(len(self.db.payments), 1)
+        self.assertEqual(len(self.db.recovery_cases), 1)
+        self.assertEqual(self.db.payments[0].merchant_id, self.db.legacy_merchant.id)
+        self.assertNotEqual(self.db.payments[0].merchant_id, second_merchant.id)
+
     def test_payment_without_customer_identity_creates_payment_only_case(self) -> None:
         payload = json.loads(webhook_body("payment.failed"))
         entity = payload["payload"]["payment"]["entity"]
@@ -293,7 +404,10 @@ class RazorpayWebhookTests(unittest.TestCase):
         self.assertEqual(len(self.db.payments), 1)
         self.assertEqual(len(self.db.recovery_cases), 1)
         self.assertIsNone(self.db.payments[0].customer_id)
+        self.assertIsNone(self.db.payments[0].transaction_id)
         self.assertIsNone(self.db.recovery_cases[0].customer_id)
+        self.assertEqual(self.db.payments[0].merchant_id, self.db.legacy_merchant.id)
+        self.assertEqual(self.db.recovery_cases[0].merchant_id, self.db.legacy_merchant.id)
 
     def test_placeholder_email_is_not_customer_identity(self) -> None:
         payload = json.loads(webhook_body("payment.failed"))
@@ -312,6 +426,51 @@ class RazorpayWebhookTests(unittest.TestCase):
         self.assertEqual(len(self.db.customers), 0)
         self.assertIsNone(self.db.payments[0].customer_id)
         self.assertIsNone(self.db.recovery_cases[0].customer_id)
+
+    def add_transaction_mapping(self) -> tuple[Customer, Transaction]:
+        customer = Customer(
+            id=uuid4(), merchant_id=self.db.legacy_merchant.id, name="Trusted Customer",
+            email="trusted@example.com", phone="+919811111111", razorpay_customer_id="cust_trusted",
+        )
+        transaction = Transaction(
+            id=uuid4(), merchant_id=self.db.legacy_merchant.id, customer_id=customer.id,
+            merchant_transaction_id="ORDER_123", razorpay_order_id="order_known_123",
+            amount=500, currency="INR", status="pending",
+        )
+        self.db.customers.append(customer)
+        self.db.transactions.append(transaction)
+        return customer, transaction
+
+    def test_failed_payment_with_known_order_uses_transaction_customer_not_checkout_contact(self) -> None:
+        customer, transaction = self.add_transaction_mapping()
+        payload = json.loads(webhook_body("payment.failed"))
+        entity = payload["payload"]["payment"]["entity"]
+        entity.update({"id": "pay_order_attempt_1", "order_id": transaction.razorpay_order_id,
+                       "email": "void@razorpay.com", "contact": "+919800000000", "customer_id": "cust_other", "method": "upi"})
+
+        response = self.post(json.dumps(payload).encode(), {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_known_order"})
+
+        self.assertEqual(response.status, "processed")
+        self.assertEqual(len(self.db.customers), 1)
+        self.assertEqual(self.db.payments[0].transaction_id, transaction.id)
+        self.assertEqual(self.db.payments[0].customer_id, customer.id)
+        self.assertEqual(self.db.payments[0].payment_method, "upi")
+        self.assertEqual(self.db.recovery_cases[0].customer_id, customer.id)
+        self.assertEqual(customer.email, "trusted@example.com")
+        self.assertEqual(customer.phone, "+919811111111")
+
+    def test_multiple_failed_attempts_can_belong_to_one_transaction(self) -> None:
+        _, transaction = self.add_transaction_mapping()
+        for index in (1, 2):
+            payload = json.loads(webhook_body("payment.failed"))
+            entity = payload["payload"]["payment"]["entity"]
+            entity["id"] = f"pay_order_attempt_{index}"
+            entity["order_id"] = transaction.razorpay_order_id
+            response = self.post(json.dumps(payload).encode(), {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": f"evt_order_attempt_{index}"})
+            self.assertEqual(response.status, "processed")
+
+        self.assertEqual(len(self.db.payments), 2)
+        self.assertEqual({payment.transaction_id for payment in self.db.payments}, {transaction.id})
 
     def test_missing_payment_id_is_rejected_without_creating_records(self) -> None:
         payload = json.loads(webhook_body("payment.failed"))

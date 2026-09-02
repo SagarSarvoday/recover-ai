@@ -27,6 +27,12 @@ class Payment(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("merchants.id", ondelete="RESTRICT"), nullable=False
+    )
+    transaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("transactions.id", ondelete="SET NULL")
+    )
     customer_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("customers.id", ondelete="SET NULL")
     )
@@ -34,6 +40,7 @@ class Payment(Base):
     currency: Mapped[str] = mapped_column(Text, nullable=False, server_default="INR")
     status: Mapped[str] = mapped_column(Text, nullable=False)
     failure_reason: Mapped[str | None] = mapped_column(Text)
+    payment_method: Mapped[str | None] = mapped_column(Text)
     razorpay_payment_id: Mapped[str | None] = mapped_column(Text, unique=True)
     razorpay_success_payment_id: Mapped[str | None] = mapped_column(Text, unique=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -41,5 +48,7 @@ class Payment(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    merchant: Mapped["Merchant"] = relationship(back_populates="payments")
+    transaction: Mapped["Transaction | None"] = relationship(back_populates="payments")
     customer: Mapped["Customer | None"] = relationship(back_populates="payments")
     recovery_case: Mapped["RecoveryCase | None"] = relationship(back_populates="payment")
