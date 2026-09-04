@@ -12,7 +12,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (
         CheckConstraint(
-            "entity_type IN ('customer', 'payment', 'recovery_case')",
+            "entity_type IN ('customer', 'payment', 'recovery_case', 'merchant')",
             name="audit_logs_entity_type_chk",
         ),
     )

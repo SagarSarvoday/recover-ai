@@ -71,3 +71,207 @@
   font-size: 12px;
   font-weight: 600;
 }
+
+.agentSuccessMessage {
+  margin-top: 18px;
+  padding: 11px 14px;
+  border: 1px solid #cceee2;
+  background: #f0faf5;
+  color: #065f46;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.agentErrorMessage {
+  margin-top: 18px;
+  padding: 11px 14px;
+  border: 1px solid #fecdd3;
+  background: #fff1f2;
+  color: #be123c;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.agentControlPanel {
+  margin-top: 32px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 24px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.agentControlHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  padding-bottom: 20px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.agentIdentity {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agentBadge {
+  font: 700 11px "DM Mono", monospace;
+  letter-spacing: 0.1em;
+  color: #64748b;
+  text-transform: uppercase;
+}
+
+.agentStatusRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.agentStatusRunning {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  border-radius: 9999px;
+  background: #ecfdf5;
+  color: #047857;
+  font: 700 12px "DM Mono", monospace;
+  letter-spacing: 0.05em;
+  border: 1px solid #a7f3d0;
+}
+
+.agentStatusOff {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  border-radius: 9999px;
+  background: #f1f5f9;
+  color: #475569;
+  font: 700 12px "DM Mono", monospace;
+  letter-spacing: 0.05em;
+  border: 1px solid #cbd5e1;
+}
+
+.pulseDot {
+  width: 8px;
+  height: 8px;
+  background: #10b981;
+  border-radius: 50%;
+  box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+  animation: pulseGreen 2s infinite;
+}
+
+@keyframes pulseGreen {
+  0% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(16, 185, 129, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+  }
+}
+
+.offDot {
+  width: 8px;
+  height: 8px;
+  background: #94a3b8;
+  border-radius: 50%;
+}
+
+.agentSubtext {
+  font-size: 13px;
+  color: #64748b;
+}
+
+.agentStartButton {
+  background: #0f766e;
+  color: #ffffff;
+  border: none;
+  padding: 10px 20px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: 0.03em;
+  transition: background 0.15s ease, transform 0.05s ease;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+}
+
+.agentStartButton:hover {
+  background: #115e59;
+}
+
+.agentStartButton:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.agentStopButton {
+  background: #ffffff;
+  color: #b91c1c;
+  border: 1px solid #fca5a5;
+  padding: 10px 20px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: 0.03em;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.agentStopButton:hover {
+  background: #fef2f2;
+  border-color: #ef4444;
+}
+
+.agentStopButton:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.agentStatsGrid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.agentStatItem {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.agentStatLabel {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94a3b8;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-family: "DM Mono", monospace;
+}
+
+.agentStatValue {
+  font-size: 14px;
+  font-weight: 700;
+  color: #1e293b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 900px) {
+  .agentStatsGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+

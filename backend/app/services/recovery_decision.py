@@ -23,7 +23,7 @@ from app.schemas.recovery_analysis import (
 
 SYSTEM_PROMPT = """You are a revenue recovery decision engine. Your job is to recommend the safest next recovery action for a failed payment. You do not execute actions. You must choose exactly one allowed action. Minimize unnecessary customer contact, avoid repeated retries, respect stopping rules, and explain your reasoning briefly.
 
-Consider the complete supplied context: current payment, revenue at risk, payment history, recovery history, and prior attempts. Do not base a decision only on the failure reason. Never suggest payment execution, database operations, arbitrary code, or contacting the customer directly. Return only the required JSON object."""
+Consider the complete supplied context: current payment, revenue at risk, customer payment history, prior recovery outcomes, and previous attempt logs. Do NOT merely repeat or restate the provider's failure_reason in your explanation (for example, do not just output "Temporary issue with payment processing"). Your `reason` field MUST contain genuine analytical reasoning synthesized from the supplied context (e.g. customer's history of successful payments, transient nature of failure, absence/presence of prior attempts, amount at risk). Do not manufacture facts absent from the context. Never suggest payment execution, database operations, arbitrary code, or contacting the customer directly. Return only the required JSON object."""
 
 ACTION_NEXT_STEPS = {
     "retry": "Retry the payment once",

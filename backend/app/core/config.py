@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     recovery_max_attempts: int = Field(default=3, ge=1)
     recovery_scheduler_enabled: bool = True
     recovery_scheduler_poll_seconds: int = Field(default=15, ge=1, le=300)
+    recovery_agent_worker_enabled: bool = True
+    recovery_agent_poll_seconds: int = Field(default=10, ge=1, le=300)
     razorpay_key_id: str | None = None
     razorpay_key_secret: SecretStr | None = None
     razorpay_webhook_secret: SecretStr | None = None

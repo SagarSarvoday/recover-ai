@@ -70,17 +70,50 @@ describe("merchant authentication flow", () => {
 
   it("loads authenticated recovery cases with a bearer authorization header", async () => {
     window.sessionStorage.setItem("recoverai.access-token", "safe-token");
-    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(merchant)).mockResolvedValueOnce(jsonResponse([]));
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/api/v1/merchant/me")) return jsonResponse(merchant);
+      if (url.includes("/api/v1/merchant/agent")) {
+        return jsonResponse({
+          enabled: false,
+          status: "stopped",
+          started_at: null,
+          last_activity_at: null,
+          active_cases: 0,
+          actions_today: 0,
+          recovered_today: 0,
+        });
+      }
+      return jsonResponse([]);
+    });
     render(<AuthProvider><Dashboard /></AuthProvider>);
     expect(await screen.findByText("Acme Store")).toBeTruthy();
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
-    const [, init] = vi.mocked(fetch).mock.calls[1];
-    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer safe-token");
+    await waitFor(() => {
+      const caseCall = vi.mocked(fetch).mock.calls.find(([input]) => String(input).includes("/api/v1/recovery-cases"));
+      expect(caseCall).toBeDefined();
+      const [, init] = caseCall!;
+      expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer safe-token");
+    });
   });
 
   it("logs out and clears the stored token", async () => {
     window.sessionStorage.setItem("recoverai.access-token", "safe-token");
-    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(merchant)).mockResolvedValueOnce(jsonResponse([]));
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/api/v1/merchant/me")) return jsonResponse(merchant);
+      if (url.includes("/api/v1/merchant/agent")) {
+        return jsonResponse({
+          enabled: false,
+          status: "stopped",
+          started_at: null,
+          last_activity_at: null,
+          active_cases: 0,
+          actions_today: 0,
+          recovered_today: 0,
+        });
+      }
+      return jsonResponse([]);
+    });
     const user = userEvent.setup();
     render(<AuthProvider><Dashboard /></AuthProvider>);
     await user.click(await screen.findByRole("button", { name: "Logout" }));
@@ -90,7 +123,11 @@ describe("merchant authentication flow", () => {
 
   it("clears the session and redirects when recovery requests return 401", async () => {
     window.sessionStorage.setItem("recoverai.access-token", "expired-token");
-    vi.mocked(fetch).mockResolvedValueOnce(jsonResponse(merchant)).mockResolvedValueOnce(jsonResponse({ detail: "Unauthorized" }, 401));
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes("/api/v1/merchant/me")) return jsonResponse(merchant);
+      return jsonResponse({ detail: "Unauthorized" }, 401);
+    });
     render(<AuthProvider><Dashboard /></AuthProvider>);
     await waitFor(() => expect(replace).toHaveBeenCalledWith("/login"));
     expect(window.sessionStorage.getItem("recoverai.access-token")).toBeNull();

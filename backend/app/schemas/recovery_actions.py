@@ -20,7 +20,7 @@ class RecoveryActionContext(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    source: Literal["manual", "ai_recommendation"] = "manual"
+    source: Literal["manual", "ai_recommendation", "recovery_agent"] = "manual"
     note: str | None = Field(default=None, max_length=300)
 
 

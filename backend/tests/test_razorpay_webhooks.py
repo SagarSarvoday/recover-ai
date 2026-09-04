@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -274,11 +275,12 @@ class RazorpayWebhookTests(unittest.TestCase):
         headers = {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_6"}
 
         first = self.post(body, headers)
+        commits_after_first = self.db.commits
         second = self.post(body, headers)
 
         self.assertEqual(first.status, "processed")
         self.assertEqual(second.status, "duplicate")
-        self.assertEqual(self.db.commits, 1)
+        self.assertEqual(self.db.commits, commits_after_first)
 
     def test_same_payment_with_a_new_event_does_not_duplicate_recovery_case(self) -> None:
         body = webhook_body("payment.failed")
@@ -566,6 +568,28 @@ class RazorpayWebhookTests(unittest.TestCase):
             self.db.recovery_cases[0].amount_at_risk,
         )
 
+    def test_payment_failed_triggers_recovery_agent_when_merchant_agent_enabled(self) -> None:
+        self.db.merchants[0].ai_agent_enabled = True
+        with patch("app.services.razorpay_webhooks.run_recovery_agent") as mock_agent:
+            response = self.post(
+                webhook_body("payment.failed"),
+                {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_agent_enabled_test"},
+            )
+        self.assertEqual(response.status, "processed")
+        mock_agent.assert_called_once()
+        self.assertEqual(mock_agent.call_args[1]["trigger"], "payment_failed_webhook")
+
+    def test_payment_failed_does_not_trigger_recovery_agent_when_merchant_agent_disabled(self) -> None:
+        self.db.merchants[0].ai_agent_enabled = False
+        with patch("app.services.razorpay_webhooks.run_recovery_agent") as mock_agent:
+            response = self.post(
+                webhook_body("payment.failed"),
+                {"X-Razorpay-Signature": "valid", "X-Razorpay-Event-Id": "evt_agent_disabled_test"},
+            )
+        self.assertEqual(response.status, "processed")
+        mock_agent.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
+

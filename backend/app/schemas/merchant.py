@@ -1,5 +1,7 @@
 import re
 from datetime import datetime
+from decimal import Decimal
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -12,8 +14,33 @@ class MerchantProfileResponse(BaseModel):
     name: str
     email: str
     razorpay_account_id: str | None
+    ai_agent_enabled: bool = False
+    ai_agent_started_at: datetime | None = None
+    ai_agent_updated_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("ai_agent_enabled", mode="before")
+    @classmethod
+    def validate_ai_agent_enabled(cls, value: object) -> bool:
+        return bool(value)
+
+
+class MerchantAgentStatusResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    enabled: bool
+    status: Literal["running", "stopped"]
+    started_at: datetime | None = None
+    last_activity_at: datetime | None = None
+    active_cases: int
+    actions_today: int
+    recovered_today: Decimal
+
+    @field_validator("enabled", mode="before")
+    @classmethod
+    def validate_enabled(cls, value: object) -> bool:
+        return bool(value)
 
 
 class RazorpayAccountUpdateRequest(BaseModel):

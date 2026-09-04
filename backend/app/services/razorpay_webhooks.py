@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -8,6 +9,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.audit_log import AuditLog
 from app.models.customer import Customer
 from app.models.merchant import Merchant
@@ -16,6 +18,9 @@ from app.models.recovery_case import RecoveryCase
 from app.models.razorpay_webhook_event import RazorpayWebhookEvent
 from app.models.transaction import Transaction
 from app.schemas.razorpay import RazorpayWebhookEnvelope
+from app.services.recovery_agent import run_recovery_agent
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_RAZORPAY_EVENTS = {"payment.failed", "payment_link.paid"}
 
@@ -340,6 +345,29 @@ def ingest_payment_failed_webhook(
         )
     )
     db.commit()
+
+    if recovery_case.status in {"open", "in_progress"}:
+        if merchant.ai_agent_enabled:
+            try:
+                run_recovery_agent(
+                    db,
+                    recovery_case.id,
+                    trigger="payment_failed_webhook",
+                    max_recovery_attempts=settings.recovery_max_attempts,
+                    settings=settings,
+                )
+            except Exception:
+                logger.exception(
+                    "Autonomous recovery agent execution failed for case %s following payment.failed webhook",
+                    recovery_case.id,
+                )
+        else:
+            logger.info(
+                "Merchant %s has AI agent disabled; skipping autonomous agent execution for case %s.",
+                merchant.id,
+                recovery_case.id,
+            )
+
     return "processed"
 
 

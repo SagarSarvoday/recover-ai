@@ -220,57 +220,17 @@ def retry_payment(
     case.last_attempt_at = datetime.now(timezone.utc)
     case.status = "in_progress"
 
-    # Deterministic simulation:
-    # transient/temporary payment failures succeed on retry.
-    failure_reason = getattr(payment, "failure_reason", None) or ""
-    failure_reason = failure_reason.lower()
-
-    recoverable_failure = any(
-        keyword in failure_reason
-        for keyword in (
-            "temporary",
-            "transient",
-            "timeout",
-            "network",
-            "bank error",
-        )
+        # Simulated retry: a retry attempt does not itself confirm payment success.
+    # Successful recovery is confirmed only by the payment-success webhook.
+    result = ActionResult(
+        case_id=tool_input.case_id,
+        action="retry_payment",
+        success=False,
+        outcome="failed",
+        amount_recovered=Decimal("0.00"),
+        message="Simulated payment retry failed; awaiting payment confirmation.",
+        guardrails_applied=guardrails,
     )
-
-    if recoverable_failure:
-        recovered_amount = min(
-            case.amount_at_risk - case.amount_recovered,
-            payment.amount,
-        )
-
-        case.amount_recovered += recovered_amount
-        case.status = "recovered"
-
-        payment.status = "succeeded"
-        payment.failure_reason = None
-        payment.paid_at = datetime.now(timezone.utc)
-
-        result = ActionResult(
-            case_id=tool_input.case_id,
-            action="retry_payment",
-            success=True,
-            outcome="recovered",
-            amount_recovered=recovered_amount,
-            message=(
-                f"Simulated payment retry succeeded. "
-                f"₹{recovered_amount:.2f} recovered."
-            ),
-            guardrails_applied=guardrails,
-        )
-    else:
-        result = ActionResult(
-            case_id=tool_input.case_id,
-            action="retry_payment",
-            success=False,
-            outcome="failed",
-            amount_recovered=Decimal("0.00"),
-            message="Simulated payment retry failed.",
-            guardrails_applied=guardrails,
-        )
 
     _record_action_attempt(
         db,

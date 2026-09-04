@@ -93,7 +93,7 @@ export default function TestPaymentPage() {
       currency: "INR",
       name: "RecoverAI",
       description: "TEST-TANYA-001",
-      order_id: "order_TX2m3w5tJ4FB8a",
+      order_id: "order_TXB0G2Go52Sq9J",
       handler: (response) => {
         setResult({ status: "success", ...response });
         setIsOpening(false);

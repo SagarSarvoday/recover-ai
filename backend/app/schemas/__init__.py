@@ -18,13 +18,18 @@ from app.schemas.auth import (
     MerchantLoginRequest,
     MerchantRegistrationRequest,
 )
-from app.schemas.merchant import MerchantProfileResponse, RazorpayAccountUpdateRequest
+from app.schemas.merchant import (
+    MerchantAgentStatusResponse,
+    MerchantProfileResponse,
+    RazorpayAccountUpdateRequest,
+)
 from app.schemas.transaction import TransactionCreateRequest, TransactionResponse
 
 __all__ = [
     "ActionResult",
     "AccessTokenResponse",
     "AuthenticatedMerchantResponse",
+    "MerchantAgentStatusResponse",
     "MerchantLoginRequest",
     "MerchantProfileResponse",
     "MerchantRegistrationRequest",

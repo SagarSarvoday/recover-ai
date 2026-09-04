@@ -14,6 +14,9 @@ CREATE TABLE merchants (
     email               TEXT NOT NULL UNIQUE,
     password_hash       TEXT,
     razorpay_account_id TEXT UNIQUE,
+    ai_agent_enabled    BOOLEAN NOT NULL DEFAULT FALSE,
+    ai_agent_started_at TIMESTAMPTZ,
+    ai_agent_updated_at TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -180,7 +183,7 @@ CREATE UNIQUE INDEX scheduled_recovery_actions_one_active_case_action_key
 -- ---------------------------------------------------------------------------
 CREATE TABLE audit_logs (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    entity_type   TEXT NOT NULL CHECK (entity_type IN ('customer', 'payment', 'recovery_case')),
+    entity_type   TEXT NOT NULL CHECK (entity_type IN ('customer', 'payment', 'recovery_case', 'merchant')),
     entity_id     UUID NOT NULL,
     action        TEXT NOT NULL,
     actor         TEXT NOT NULL DEFAULT 'system',

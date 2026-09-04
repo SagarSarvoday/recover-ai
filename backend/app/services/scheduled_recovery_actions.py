@@ -7,10 +7,13 @@ from uuid import UUID
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
+from app.models.merchant import Merchant
 from app.models.recovery_case import RecoveryCase
 from app.models.scheduled_recovery_action import ScheduledRecoveryAction
 from app.schemas.recovery_actions import RecoveryActionContext
 from app.services.recovery_actions import RecoveryActionExecutionContext, execute_recovery_action
+from app.services.recovery_agent import run_recovery_agent
 
 logger = logging.getLogger(__name__)
 LEASE_SECONDS = 60
@@ -100,6 +103,35 @@ def execute_claimed_scheduled_action(
 
     # The deterministic action was invoked, even if a retry itself did not recover payment.
     _finish_job(db, job, "completed", now, None)
+
+    # Outcome feeds back into the agent workflow if recovery is still active.
+    fresh_case = db.get(RecoveryCase, job.recovery_case_id)
+    if (
+        fresh_case is not None
+        and fresh_case.status in {"open", "in_progress"}
+        and fresh_case.attempt_count < max_recovery_attempts
+    ):
+        merchant = db.get(Merchant, fresh_case.merchant_id)
+        if merchant is not None and merchant.ai_agent_enabled:
+            try:
+                run_recovery_agent(
+                    db,
+                    fresh_case.id,
+                    trigger="scheduled_action",
+                    max_recovery_attempts=max_recovery_attempts,
+                    settings=settings,
+                )
+            except Exception:
+                logger.exception(
+                    "Autonomous recovery agent execution failed for case %s following scheduled action",
+                    fresh_case.id,
+                )
+        else:
+            logger.info(
+                "Merchant %s has AI agent disabled; skipping autonomous continuation for case %s.",
+                fresh_case.merchant_id,
+                fresh_case.id,
+            )
 
 
 def run_scheduled_recovery_actions(session_factory: object, *, max_recovery_attempts: int) -> int:

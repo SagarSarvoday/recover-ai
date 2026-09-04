@@ -2,7 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ApiError, authenticatedRequest } from "../lib/api";
+import {
+  ApiError,
+  authenticatedRequest,
+  getMerchantAgentStatus,
+  startMerchantAgent,
+  stopMerchantAgent,
+  type MerchantAgentStatus,
+} from "../lib/api";
 import { useAuth } from "./auth-provider";
 import styles from "../app/page.module.css";
 
@@ -48,6 +55,20 @@ function readable(value: string): string {
   return value.replace(/_/g, " ");
 }
 
+function formatTimestamp(value: string | null | undefined): string {
+  if (!value) return "—";
+  try {
+    return new Date(value).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      day: "numeric",
+      month: "short",
+    });
+  } catch {
+    return value;
+  }
+}
+
 export default function Dashboard() {
   const router = useRouter();
   const { merchant, accessToken, isLoading: isAuthenticating, logout } = useAuth();
@@ -58,6 +79,9 @@ export default function Dashboard() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [actionCaseId, setActionCaseId] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [agentStatus, setAgentStatus] = useState<MerchantAgentStatus | null>(null);
+  const [isTogglingAgent, setIsTogglingAgent] = useState(false);
+  const [agentFeedback, setAgentFeedback] = useState<{ type: "success" | "error"; message: string } | null>(null);
 
   const handleUnauthorized = useCallback(() => {
     logout();
@@ -128,25 +152,93 @@ const runWorkflow = useCallback(async (caseId: string) => {
     if (merchant) void loadCases();
   }, [isAuthenticating, loadCases, merchant, router]);
 
-const metrics = useMemo(() => {
-  const atRisk = cases.reduce(
-    (sum, item) => sum + toNumber(item.amount_at_risk),
-    0,
-  );
+  const loadAgentStatus = useCallback(async () => {
+    if (!accessToken) return;
+    try {
+      const data = await getMerchantAgentStatus(accessToken);
+      setAgentStatus(data);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        handleUnauthorized();
+      }
+    }
+  }, [accessToken, handleUnauthorized]);
 
-  const recovered = cases.reduce(
-    (sum, item) =>
-      sum + toNumber(item.recovered_amount ?? item.amount_recovered),
-    0,
-  );
+  useEffect(() => {
+    if (!accessToken || !merchant) return;
+    void loadAgentStatus();
+    const interval = setInterval(() => {
+      void loadAgentStatus();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [accessToken, loadAgentStatus, merchant]);
 
-  return {
-    atRisk,
-    recovered,
-    rate: atRisk ? (recovered / atRisk) * 100 : 0,
-    active: cases.filter((item) => activeStatuses.has(item.status)).length,
-  };
-}, [cases]);
+  const handleToggleAgent = useCallback(async () => {
+    if (!accessToken) return handleUnauthorized();
+    setIsTogglingAgent(true);
+    setAgentFeedback(null);
+    try {
+      if (agentStatus?.enabled) {
+        const updated = await stopMerchantAgent(accessToken);
+        setAgentStatus(updated);
+        setAgentFeedback({
+          type: "success",
+          message: "AI Recovery Agent stopped. Autonomous cycles paused.",
+        });
+      } else {
+        const updated = await startMerchantAgent(accessToken);
+        setAgentStatus(updated);
+        setAgentFeedback({
+          type: "success",
+          message: "AI Recovery Agent is RUNNING. Autonomous cycles active.",
+        });
+      }
+      await loadCases(true);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        handleUnauthorized();
+        return;
+      }
+      setAgentFeedback({
+        type: "error",
+        message: err instanceof Error ? err.message : "Failed to update AI recovery agent.",
+      });
+    } finally {
+      setIsTogglingAgent(false);
+    }
+  }, [accessToken, agentStatus?.enabled, handleUnauthorized, loadCases]);
+
+  const nextScheduledAction = useMemo(() => {
+    const scheduled = cases
+      .filter((c) => c.next_action_at && new Date(c.next_action_at).getTime() > Date.now())
+      .sort((a, b) => new Date(a.next_action_at!).getTime() - new Date(b.next_action_at!).getTime());
+    if (scheduled.length === 0) return null;
+    const first = scheduled[0];
+    return {
+      action: first.scheduled_action ? readable(first.scheduled_action) : "recovery followup",
+      time: formatTimestamp(first.next_action_at),
+    };
+  }, [cases]);
+
+  const metrics = useMemo(() => {
+    const atRisk = cases.reduce(
+      (sum, item) => sum + toNumber(item.amount_at_risk),
+      0,
+    );
+
+    const recovered = cases.reduce(
+      (sum, item) =>
+        sum + toNumber(item.recovered_amount ?? item.amount_recovered),
+      0,
+    );
+
+    return {
+      atRisk,
+      recovered,
+      rate: atRisk ? (recovered / atRisk) * 100 : 0,
+      active: cases.filter((item) => activeStatuses.has(item.status)).length,
+    };
+  }, [cases]);
 
 if (isAuthenticating || !merchant) {
   return <main className={styles.authLoading}>Checking your merchant session…</main>;
@@ -214,6 +306,99 @@ return (
           {actionMessage}
         </div>
       )}
+
+      {agentFeedback && (
+        <div
+          className={
+            agentFeedback.type === "success"
+              ? styles.agentSuccessMessage
+              : styles.agentErrorMessage
+          }
+          role="status"
+        >
+          {agentFeedback.message}
+        </div>
+      )}
+
+      <section className={styles.agentControlPanel} aria-label="AI Recovery Agent Control">
+        <div className={styles.agentControlHeader}>
+          <div className={styles.agentIdentity}>
+            <span className={styles.agentBadge}>AI AGENT</span>
+            <div className={styles.agentStatusRow}>
+              <div
+                className={
+                  agentStatus?.enabled
+                    ? styles.agentStatusRunning
+                    : styles.agentStatusOff
+                }
+              >
+                <span
+                  className={
+                    agentStatus?.enabled ? styles.pulseDot : styles.offDot
+                  }
+                />
+                {agentStatus?.enabled ? "RUNNING" : "OFF"}
+              </div>
+              <span className={styles.agentSubtext}>
+                {agentStatus?.enabled
+                  ? "Continuously watching eligible recovery work and triggering autonomous cycles."
+                  : "Autonomous agent cycles are currently paused for your store."}
+              </span>
+            </div>
+          </div>
+
+          <button
+            className={
+              agentStatus?.enabled
+                ? styles.agentStopButton
+                : styles.agentStartButton
+            }
+            onClick={() => void handleToggleAgent()}
+            disabled={isTogglingAgent}
+          >
+            {isTogglingAgent
+              ? "Updating..."
+              : agentStatus?.enabled
+              ? "STOP AI AGENT"
+              : "START AI AGENT"}
+          </button>
+        </div>
+
+        <div className={styles.agentStatsGrid}>
+          <div className={styles.agentStatItem}>
+            <span className={styles.agentStatLabel}>Active cases</span>
+            <strong className={styles.agentStatValue}>
+              {agentStatus?.active_cases ?? 0}
+            </strong>
+          </div>
+          <div className={styles.agentStatItem}>
+            <span className={styles.agentStatLabel}>Actions today</span>
+            <strong className={styles.agentStatValue}>
+              {agentStatus?.actions_today ?? 0}
+            </strong>
+          </div>
+          <div className={styles.agentStatItem}>
+            <span className={styles.agentStatLabel}>Recovered today</span>
+            <strong className={styles.agentStatValue}>
+              {formatCurrency(toNumber(agentStatus?.recovered_today))}
+            </strong>
+          </div>
+          <div className={styles.agentStatItem}>
+            <span className={styles.agentStatLabel}>Last activity</span>
+            <strong className={styles.agentStatValue}>
+              {formatTimestamp(agentStatus?.last_activity_at)}
+            </strong>
+          </div>
+          <div className={styles.agentStatItem}>
+            <span className={styles.agentStatLabel}>Next scheduled action</span>
+            <strong className={styles.agentStatValue}>
+              {nextScheduledAction
+                ? `${nextScheduledAction.action} (${nextScheduledAction.time})`
+                : "None"}
+            </strong>
+          </div>
+        </div>
+      </section>
 
       <section className={styles.metrics} aria-label="Recovery metrics">
         <MetricCard

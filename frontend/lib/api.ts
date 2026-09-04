@@ -54,6 +54,29 @@ export function updateRazorpayAccount(accessToken: string, razorpayAccountId: st
   }, accessToken);
 }
 
+export type MerchantAgentStatus = {
+  enabled: boolean;
+  status: "running" | "stopped";
+  started_at: string | null;
+  last_activity_at: string | null;
+  active_cases: number;
+  actions_today: number;
+  recovered_today: number | string;
+};
+
+export function getMerchantAgentStatus(accessToken: string): Promise<MerchantAgentStatus> {
+  return apiRequest("/api/v1/merchant/agent", {}, accessToken);
+}
+
+export function startMerchantAgent(accessToken: string): Promise<MerchantAgentStatus> {
+  return apiRequest("/api/v1/merchant/agent/start", { method: "POST" }, accessToken);
+}
+
+export function stopMerchantAgent(accessToken: string): Promise<MerchantAgentStatus> {
+  return apiRequest("/api/v1/merchant/agent/stop", { method: "POST" }, accessToken);
+}
+
 export function authenticatedRequest<T>(path: string, accessToken: string, init: RequestInit = {}): Promise<T> {
   return apiRequest<T>(path, init, accessToken);
 }
+

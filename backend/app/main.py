@@ -8,15 +8,18 @@ from app.api.router import api_router
 from app.core.config import settings
 from app.core.database import SessionLocal, engine  # noqa: F401 — initialize the SQLAlchemy engine
 from app.models import Base  # noqa: F401 — register ORM models against the existing schema
+from app.services.recovery_agent_worker import run_continuous_recovery_agent_cycle
 from app.services.scheduled_recovery_actions import run_scheduled_recovery_actions
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     stop_event = threading.Event()
-    worker: threading.Thread | None = None
+    scheduler_worker: threading.Thread | None = None
+    agent_worker: threading.Thread | None = None
+
     if settings.recovery_scheduler_enabled:
-        def poll() -> None:
+        def poll_scheduler() -> None:
             while not stop_event.is_set():
                 try:
                     run_scheduled_recovery_actions(
@@ -28,14 +31,34 @@ async def lifespan(_: FastAPI):
                     logging.getLogger(__name__).exception("Scheduled recovery polling cycle failed.")
                 stop_event.wait(settings.recovery_scheduler_poll_seconds)
 
-        worker = threading.Thread(target=poll, name="recovery-scheduler", daemon=True)
-        worker.start()
+        scheduler_worker = threading.Thread(target=poll_scheduler, name="recovery-scheduler", daemon=True)
+        scheduler_worker.start()
+
+    if settings.recovery_agent_worker_enabled:
+        def poll_agent() -> None:
+            while not stop_event.is_set():
+                try:
+                    run_continuous_recovery_agent_cycle(
+                        SessionLocal,
+                        max_recovery_attempts=settings.recovery_max_attempts,
+                        settings=settings,
+                    )
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception("Continuous recovery agent worker cycle failed.")
+                stop_event.wait(settings.recovery_agent_poll_seconds)
+
+        agent_worker = threading.Thread(target=poll_agent, name="recovery-agent-worker", daemon=True)
+        agent_worker.start()
+
     try:
         yield
     finally:
         stop_event.set()
-        if worker is not None:
-            worker.join(timeout=settings.recovery_scheduler_poll_seconds + 1)
+        if scheduler_worker is not None:
+            scheduler_worker.join(timeout=settings.recovery_scheduler_poll_seconds + 1)
+        if agent_worker is not None:
+            agent_worker.join(timeout=settings.recovery_agent_poll_seconds + 1)
 
 app = FastAPI(
     title="RecoverAI API",

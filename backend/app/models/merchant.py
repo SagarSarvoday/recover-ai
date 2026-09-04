@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Text, func
+from sqlalchemy import Boolean, DateTime, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +19,11 @@ class Merchant(Base):
     # Authentication is intentionally out of scope; this remains nullable until onboarding exists.
     password_hash: Mapped[str | None] = mapped_column(Text)
     razorpay_account_id: Mapped[str | None] = mapped_column(Text, unique=True)
+    ai_agent_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
+    ai_agent_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ai_agent_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

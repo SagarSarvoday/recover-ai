@@ -8,6 +8,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from app.models.customer import Customer
+from app.models.merchant import Merchant
 from app.models.payment import Payment
 from app.models.recovery_case import RecoveryCase
 from app.models.scheduled_recovery_action import ScheduledRecoveryAction
@@ -17,12 +18,13 @@ from app.services.scheduled_recovery_actions import execute_claimed_scheduled_ac
 
 
 class FakeSession:
-    def __init__(self, case, payment, customer, job=None, existing_job=None):
+    def __init__(self, case, payment, customer, job=None, existing_job=None, merchant=None):
         self.case = case
         self.payment = payment
         self.customer = customer
         self.job = job
         self.existing_job = existing_job
+        self.merchant = merchant
         self.added = []
         self.commit_count = 0
         self.closed = False
@@ -36,6 +38,8 @@ class FakeSession:
             return self.customer
         if model is ScheduledRecoveryAction and self.job is not None and object_id == self.job.id:
             return self.job
+        if model is Merchant and self.merchant is not None and object_id == self.merchant.id:
+            return self.merchant
         return None
 
     def scalar(self, _query):
@@ -54,6 +58,7 @@ class FakeSession:
 class ScheduledRecoveryActionTests(unittest.TestCase):
     def setUp(self):
         self.merchant_id = uuid4()
+        self.merchant = SimpleNamespace(id=self.merchant_id, ai_agent_enabled=False)
         self.case_id = uuid4()
         self.customer_id = uuid4()
         self.payment_id = uuid4()
@@ -68,7 +73,7 @@ class ScheduledRecoveryActionTests(unittest.TestCase):
             status="failed", failure_reason="temporary bank error", paid_at=None,
         )
         self.customer = SimpleNamespace(id=self.customer_id, name="Test", email="test@example.com", phone=None)
-        self.db = FakeSession(self.case, self.payment, self.customer)
+        self.db = FakeSession(self.case, self.payment, self.customer, merchant=self.merchant)
         self.context = RecoveryActionExecutionContext(db=self.db, max_recovery_attempts=3)
 
     def test_wait_with_validated_timing_persists_a_retry_job(self):
@@ -151,8 +156,8 @@ class ScheduledRecoveryActionTests(unittest.TestCase):
             scheduled_at=datetime.now(timezone.utc) - timedelta(minutes=1), status="running", attempt_count=1,
             lease_expires_at=None, executed_at=None, error_message=None,
         )
-        claim_session = FakeSession(self.case, self.payment, self.customer)
-        execute_session = FakeSession(self.case, self.payment, self.customer, job=job)
+        claim_session = FakeSession(self.case, self.payment, self.customer, merchant=self.merchant)
+        execute_session = FakeSession(self.case, self.payment, self.customer, job=job, merchant=self.merchant)
         sessions = iter([claim_session, execute_session])
         with patch("app.services.scheduled_recovery_actions.claim_due_scheduled_actions", return_value=[job.id]):
             count = run_scheduled_recovery_actions(lambda: next(sessions), max_recovery_attempts=3)
@@ -160,6 +165,27 @@ class ScheduledRecoveryActionTests(unittest.TestCase):
         self.assertTrue(claim_session.closed)
         self.assertTrue(execute_session.closed)
         self.assertEqual(job.status, "completed")
+
+    def test_scheduler_continuation_invokes_agent_when_merchant_agent_enabled(self):
+        self.merchant.ai_agent_enabled = True
+        self.payment.failure_reason = "card declined"
+        with patch("app.services.scheduled_recovery_actions.run_recovery_agent") as mock_run:
+            job = self._run_job()
+        self.assertEqual(job.status, "completed")
+        mock_run.assert_called_once_with(
+            self.db,
+            self.case.id,
+            trigger="scheduled_action",
+            max_recovery_attempts=3,
+            settings=unittest.mock.ANY,
+        )
+
+    def test_scheduler_continuation_skips_agent_when_merchant_agent_disabled(self):
+        self.merchant.ai_agent_enabled = False
+        with patch("app.services.scheduled_recovery_actions.run_recovery_agent") as mock_run:
+            job = self._run_job()
+        self.assertEqual(job.status, "completed")
+        mock_run.assert_not_called()
 
 
 if __name__ == "__main__":
