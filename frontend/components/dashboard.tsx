@@ -2,13 +2,21 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import {
   ApiError,
   authenticatedRequest,
   getMerchantAgentStatus,
+  getMerchantMetrics,
+  getRecoveryCaseActivity,
   startMerchantAgent,
   stopMerchantAgent,
+  triggerManualCloseCase,
+  triggerManualRetryLink,
+  triggerRunAnalysis,
+  type CaseActivityEvent,
   type MerchantAgentStatus,
+  type MerchantMetrics,
 } from "../lib/api";
 import { useAuth } from "./auth-provider";
 import styles from "../app/page.module.css";
@@ -22,7 +30,7 @@ type ApiRecoveryCase = {
   payment_status: string;
   failure_reason: string | null;
   payment_amount: number | string;
-  status: "open" | "in_progress" | "recovered" | "closed";
+  status: "open" | "in_progress" | "waiting" | "payment_link_active" | "recovered" | "closed";
   amount_at_risk: number | string;
   recovered_amount?: number | string;
   amount_recovered?: number | string;
@@ -30,13 +38,20 @@ type ApiRecoveryCase = {
   ai_decision: "retry" | "contact" | "wait" | "skip" | "close" | null;
   ai_reason?: string | null;
   ai_decision_note?: string | null;
+  ai_confidence?: number | null;
   next_action_at?: string | null;
   scheduled_action?: string | null;
+  razorpay_payment_link_id?: string | null;
+  payment_link_status?: "not_created" | "active" | "expired" | "paid";
+  payment_link_expires_at?: string | null;
+  payment_link_created_at?: string | null;
+  payment_link_sent_at?: string | null;
+  payment_link_paid_at?: string | null;
   created_at: string;
   updated_at: string;
 };
 
-const activeStatuses = new Set(["open", "in_progress"]);
+const activeStatuses = new Set(["open", "in_progress", "waiting", "payment_link_active"]);
 
 function toNumber(value: string | number | undefined): number {
   const parsed = Number(value ?? 0);
@@ -69,6 +84,59 @@ function formatTimestamp(value: string | null | undefined): string {
   }
 }
 
+function getTimelineDetailsSummary(action: string, details?: Record<string, unknown>): { title: string; dotClass: string; summary?: string } {
+  const normAction = action.toLowerCase();
+  if (normAction.includes("payment_link.paid") || normAction.includes("payment_recovered") || normAction.includes("recovered")) {
+    return {
+      title: "Razorpay Payment Settled & Case Recovered",
+      dotClass: styles.timelineDotGreen,
+      summary: details?.amount ? `Amount received: ₹${Number(details.amount).toFixed(2)}` : "Confirmed via Razorpay webhook signature",
+    };
+  }
+  if (normAction === "notification_sent") {
+    const channel = details?.channel ? String(details.channel) : "email";
+    return {
+      title: `Recovery Notification Delivered (${channel.toUpperCase()})`,
+      dotClass: styles.timelineDotGreen,
+      summary: details?.recipient ? `Sent to ${details.recipient}` : "Payment link successfully delivered to customer",
+    };
+  }
+  if (normAction === "notification_failed") {
+    const reason = details?.reason ? String(details.reason) : "unknown error";
+    return {
+      title: "Notification Delivery Attempt Failed",
+      dotClass: styles.timelineDotRed,
+      summary: `Failure reason: ${readable(reason)}`,
+    };
+  }
+  if (normAction.includes("payment_link") || normAction.includes("retry_payment")) {
+    return {
+      title: normAction.includes("reused") ? "Active Payment Link Reused" : "Razorpay Payment Link Generated",
+      dotClass: styles.timelineDotBlue,
+      summary: details?.razorpay_payment_link_id ? `Link ID: ${details.razorpay_payment_link_id}` : undefined,
+    };
+  }
+  if (normAction.includes("ai_decision") || normAction.includes("analyzed") || normAction.includes("recommendation")) {
+    return {
+      title: "AI Recovery Assessment Completed",
+      dotClass: styles.timelineDotAmber,
+      summary: details?.decision ? `Decision: ${readable(String(details.decision))}` : undefined,
+    };
+  }
+  if (normAction === "case_status_transition") {
+    const toStatus = details?.to_status ? readable(String(details.to_status)) : "updated";
+    return {
+      title: `Case Status Changed → ${toStatus}`,
+      dotClass: styles.timelineDotAmber,
+      summary: details?.reason ? `Trigger: ${readable(String(details.reason))}` : undefined,
+    };
+  }
+  return {
+    title: readable(action),
+    dotClass: styles.timelineDotBlue,
+  };
+}
+
 export default function Dashboard() {
   const router = useRouter();
   const { merchant, accessToken, isLoading: isAuthenticating, logout } = useAuth();
@@ -82,11 +150,46 @@ export default function Dashboard() {
   const [agentStatus, setAgentStatus] = useState<MerchantAgentStatus | null>(null);
   const [isTogglingAgent, setIsTogglingAgent] = useState(false);
   const [agentFeedback, setAgentFeedback] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const [inspectCase, setInspectCase] = useState<ApiRecoveryCase | null>(null);
+  const [activityLogs, setActivityLogs] = useState<CaseActivityEvent[]>([]);
+  const [isLoadingActivity, setIsLoadingActivity] = useState(false);
+  const [metricsData, setMetricsData] = useState<MerchantMetrics | null>(null);
+  const [isPerformingDrawerAction, setIsPerformingDrawerAction] = useState(false);
+  const [drawerActionMessage, setDrawerActionMessage] = useState<string | null>(null);
+
+  // Filter & Sort states
+  const [filterSearch, setFilterSearch] = useState("");
+  const [filterStatus, setFilterStatus] = useState("all");
+  const [filterDecision, setFilterDecision] = useState("all");
+  const [filterLinkStatus, setFilterLinkStatus] = useState("all");
+  const [filterSort, setFilterSort] = useState("newest_failure");
+  const [quickFilter, setQuickFilter] = useState<"all" | "waiting" | "expired">("all");
 
   const handleUnauthorized = useCallback(() => {
     logout();
     router.replace("/login");
   }, [logout, router]);
+
+  const handleOpenInspect = useCallback(async (c: ApiRecoveryCase) => {
+    setInspectCase(c);
+    setDrawerActionMessage(null);
+    if (!accessToken) return;
+    setIsLoadingActivity(true);
+    try {
+      const logs = await getRecoveryCaseActivity(c.id, accessToken);
+      setActivityLogs(logs);
+    } catch {
+      setActivityLogs([]);
+    } finally {
+      setIsLoadingActivity(false);
+    }
+  }, [accessToken]);
+
+  const handleCloseInspect = useCallback(() => {
+    setInspectCase(null);
+    setActivityLogs([]);
+    setDrawerActionMessage(null);
+  }, []);
 
   const loadCases = useCallback(async (refresh = false) => {
     if (!accessToken) return;
@@ -95,9 +198,13 @@ export default function Dashboard() {
     setError(null);
 
     try {
-      const data: unknown = await authenticatedRequest("/api/v1/recovery-cases", accessToken);
-      if (!Array.isArray(data)) throw new Error("The API returned an unexpected response.");
-      setCases(data as ApiRecoveryCase[]);
+      const [caseData, metricData] = await Promise.all([
+        authenticatedRequest<ApiRecoveryCase[]>("/api/v1/recovery-cases", accessToken),
+        getMerchantMetrics(accessToken).catch(() => null),
+      ]);
+      if (!Array.isArray(caseData)) throw new Error("The API returned an unexpected response.");
+      setCases(caseData);
+      if (metricData) setMetricsData(metricData);
       setLastUpdated(new Date());
     } catch (requestError) {
       if (requestError instanceof ApiError && requestError.status === 401) {
@@ -110,6 +217,57 @@ export default function Dashboard() {
       setIsRefreshing(false);
     }
   }, [accessToken, handleUnauthorized]);
+
+  const handleManualAnalyze = useCallback(async (caseId: string) => {
+    if (!accessToken) return handleUnauthorized();
+    setIsPerformingDrawerAction(true);
+    setDrawerActionMessage(null);
+    try {
+      const res = await triggerRunAnalysis(caseId, accessToken);
+      setDrawerActionMessage(`AI analysis complete: recommended "${res.decision.action}".`);
+      await loadCases(true);
+      const logs = await getRecoveryCaseActivity(caseId, accessToken);
+      setActivityLogs(logs);
+    } catch (err) {
+      setDrawerActionMessage(err instanceof Error ? err.message : "Failed to run analysis.");
+    } finally {
+      setIsPerformingDrawerAction(false);
+    }
+  }, [accessToken, handleUnauthorized, loadCases]);
+
+  const handleManualRetryLink = useCallback(async (caseId: string) => {
+    if (!accessToken) return handleUnauthorized();
+    setIsPerformingDrawerAction(true);
+    setDrawerActionMessage(null);
+    try {
+      const res = await triggerManualRetryLink(caseId, accessToken);
+      setDrawerActionMessage(res.action_execution_result.message);
+      await loadCases(true);
+      const logs = await getRecoveryCaseActivity(caseId, accessToken);
+      setActivityLogs(logs);
+    } catch (err) {
+      setDrawerActionMessage(err instanceof Error ? err.message : "Failed to trigger recovery link.");
+    } finally {
+      setIsPerformingDrawerAction(false);
+    }
+  }, [accessToken, handleUnauthorized, loadCases]);
+
+  const handleManualClose = useCallback(async (caseId: string) => {
+    if (!accessToken) return handleUnauthorized();
+    setIsPerformingDrawerAction(true);
+    setDrawerActionMessage(null);
+    try {
+      const res = await triggerManualCloseCase(caseId, accessToken);
+      setDrawerActionMessage(res.action_execution_result.message);
+      await loadCases(true);
+      const logs = await getRecoveryCaseActivity(caseId, accessToken);
+      setActivityLogs(logs);
+    } catch (err) {
+      setDrawerActionMessage(err instanceof Error ? err.message : "Failed to close recovery case.");
+    } finally {
+      setIsPerformingDrawerAction(false);
+    }
+  }, [accessToken, handleUnauthorized, loadCases]);
 
 const runWorkflow = useCallback(async (caseId: string) => {
   setActionCaseId(caseId);
@@ -221,6 +379,7 @@ const runWorkflow = useCallback(async (caseId: string) => {
   }, [cases]);
 
   const metrics = useMemo(() => {
+    const totalFailed = cases.length;
     const atRisk = cases.reduce(
       (sum, item) => sum + toNumber(item.amount_at_risk),
       0,
@@ -232,13 +391,67 @@ const runWorkflow = useCallback(async (caseId: string) => {
       0,
     );
 
+    const waiting = cases.filter(
+      (item) => item.ai_decision === "wait" && (item.status === "open" || item.status === "in_progress")
+    ).length;
+
+    const actionPending = cases.filter(
+      (item) =>
+        item.status === "in_progress" &&
+        (item.ai_decision === "retry" || item.ai_decision === "contact")
+    ).length;
+
+    const closed = cases.filter((item) => item.status === "closed").length;
+
     return {
+      totalFailed,
       atRisk,
       recovered,
       rate: atRisk ? (recovered / atRisk) * 100 : 0,
       active: cases.filter((item) => activeStatuses.has(item.status)).length,
+      waiting,
+      actionPending,
+      closed,
     };
   }, [cases]);
+
+  const filteredCases = useMemo(() => {
+    return cases
+      .filter((c) => {
+        if (quickFilter === "waiting" && c.status !== "waiting" && c.ai_decision !== "wait") return false;
+        if (quickFilter === "expired" && c.payment_link_status !== "expired") return false;
+        if (filterStatus !== "all" && c.status !== filterStatus) return false;
+        if (filterDecision !== "all" && c.ai_decision !== filterDecision) return false;
+        if (filterLinkStatus !== "all" && c.payment_link_status !== filterLinkStatus) return false;
+        if (filterSearch.trim()) {
+          const q = filterSearch.toLowerCase().trim();
+          const matchName = (c.customer_name ?? "").toLowerCase().includes(q);
+          const matchEmail = (c.customer_email ?? "").toLowerCase().includes(q);
+          if (!matchName && !matchEmail) return false;
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        if (filterSort === "highest_risk") {
+          return toNumber(b.amount_at_risk) - toNumber(a.amount_at_risk);
+        }
+        if (filterSort === "oldest_unresolved") {
+          return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+        }
+        if (filterSort === "next_action") {
+          if (!a.next_action_at) return 1;
+          if (!b.next_action_at) return -1;
+          return new Date(a.next_action_at).getTime() - new Date(b.next_action_at).getTime();
+        }
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      });
+  }, [cases, filterDecision, filterLinkStatus, filterSearch, filterSort, filterStatus, quickFilter]);
+
+  const notificationLogs = useMemo(() => {
+    return activityLogs.filter(
+      (log) => log.action === "notification_sent" || log.action === "notification_failed"
+    );
+  }, [activityLogs]);
 
 if (isAuthenticating || !merchant) {
   return <main className={styles.authLoading}>Checking your merchant session…</main>;
@@ -259,15 +472,18 @@ return (
       </a>
 
       <nav className={styles.nav} aria-label="Dashboard navigation">
-        <a className={styles.navActive} href="#top">
+        <Link className={styles.navActive} href="/dashboard">
           <span>▦</span> Overview
-        </a>
-        <a href="#cases">
+        </Link>
+        <Link href="/dashboard#cases">
           <span>◌</span> Recovery cases
-        </a>
-        <a href="/settings">
+        </Link>
+        <Link href="/customers">
+          <span>👥</span> Customers
+        </Link>
+        <Link href="/settings">
           <span>⚙</span> Settings
-        </a>
+        </Link>
       </nav>
 
       <div className={styles.sidebarFooter}>
@@ -300,6 +516,21 @@ return (
           </button>
         </div>
       </header>
+
+      {!merchant?.razorpay_account_id && (
+        <div className={styles.onboardingBanner}>
+          <div className={styles.onboardingBannerContent}>
+            <div className={styles.onboardingBannerIcon}>⚡</div>
+            <div>
+              <h3>Setup Incomplete: Connect Your Razorpay Account</h3>
+              <p>To enable autonomous recovery cycles and webhook synchronization, connect your Razorpay Merchant Account ID in Settings.</p>
+            </div>
+          </div>
+          <Link href="/settings" className={styles.onboardingBannerBtn}>
+            Configure Settings & Webhook →
+          </Link>
+        </div>
+      )}
 
       {actionMessage && (
         <div className={styles.actionMessage} role="status">
@@ -405,7 +636,7 @@ return (
           label="Revenue at risk"
           value={formatCurrency(metrics.atRisk)}
           accent="risk"
-          detail="Across all recovery cases"
+          detail={`${metrics.totalFailed} total failed payments`}
           loading={isLoading}
         />
 
@@ -413,7 +644,7 @@ return (
           label="Revenue recovered"
           value={formatCurrency(metrics.recovered)}
           accent="recovered"
-          detail="Recovered through follow-ups"
+          detail="Confirmed via payment webhook"
           loading={isLoading}
         />
 
@@ -429,7 +660,39 @@ return (
           label="Active recovery cases"
           value={String(metrics.active)}
           accent="active"
-          detail="Open or in progress"
+          detail={`${metrics.waiting} wait · ${metrics.actionPending} pending link · ${metrics.closed} closed`}
+          loading={isLoading}
+        />
+
+        <MetricCard
+          label="Payment links sent"
+          value={String(metricsData?.payment_links_sent ?? cases.filter((c) => !!c.razorpay_payment_link_id).length)}
+          accent="rate"
+          detail="Active customer outreach links"
+          loading={isLoading}
+        />
+
+        <MetricCard
+          label="Expired payment links"
+          value={String(metricsData?.expired_payment_links ?? cases.filter((c) => c.payment_link_status === "expired").length)}
+          accent="risk"
+          detail="Require reassessment / re-send"
+          loading={isLoading}
+        />
+
+        <MetricCard
+          label="Notification failures"
+          value={String(metricsData?.customer_notification_failures ?? 0)}
+          accent="active"
+          detail="Missing email or delivery issues"
+          loading={isLoading}
+        />
+
+        <MetricCard
+          label="Waiting scheduled"
+          value={String(metricsData?.waiting_cases ?? metrics.waiting)}
+          accent="rate"
+          detail="Will reassess when elapsed"
           loading={isLoading}
         />
       </section>
@@ -446,20 +709,100 @@ return (
               ? `Updated ${lastUpdated.toLocaleTimeString([], {
                   hour: "2-digit",
                   minute: "2-digit",
+                  second: "2-digit",
                 })}`
-              : "Connecting to recovery API"}
+              : null}
           </p>
+        </div>
+
+        {/* Filter and Sort Toolbar */}
+        <div className={styles.filterToolbar}>
+          <input
+            type="text"
+            className={styles.filterInput}
+            placeholder="Search by customer name or email…"
+            value={filterSearch}
+            onChange={(e) => setFilterSearch(e.target.value)}
+          />
+
+          <select
+            className={styles.filterSelect}
+            value={filterStatus}
+            onChange={(e) => setFilterStatus(e.target.value)}
+            aria-label="Filter by case status"
+          >
+            <option value="all">All Statuses</option>
+            <option value="open">Open</option>
+            <option value="in_progress">In Progress</option>
+            <option value="waiting">Waiting on Schedule</option>
+            <option value="payment_link_active">Payment Link Active</option>
+            <option value="recovered">Recovered</option>
+            <option value="closed">Closed</option>
+          </select>
+
+          <select
+            className={styles.filterSelect}
+            value={filterDecision}
+            onChange={(e) => setFilterDecision(e.target.value)}
+            aria-label="Filter by AI decision"
+          >
+            <option value="all">All AI Decisions</option>
+            <option value="retry">Retry</option>
+            <option value="contact">Contact</option>
+            <option value="wait">Wait</option>
+            <option value="skip">Skip</option>
+            <option value="close">Close</option>
+          </select>
+
+          <select
+            className={styles.filterSelect}
+            value={filterLinkStatus}
+            onChange={(e) => setFilterLinkStatus(e.target.value)}
+            aria-label="Filter by payment link state"
+          >
+            <option value="all">All Link States</option>
+            <option value="active">Active Link</option>
+            <option value="expired">Expired Link</option>
+            <option value="paid">Paid Link</option>
+            <option value="not_created">Not Created</option>
+          </select>
+
+          <select
+            className={styles.filterSelect}
+            value={filterSort}
+            onChange={(e) => setFilterSort(e.target.value)}
+            aria-label="Sort cases"
+          >
+            <option value="newest_failure">Newest Failure</option>
+            <option value="highest_risk">Highest Risk Amount</option>
+            <option value="oldest_unresolved">Oldest Unresolved</option>
+            <option value="next_action">Next Scheduled Action</option>
+          </select>
+
+          <div className={styles.pillGroup}>
+            <button
+              type="button"
+              className={`${styles.filterPill} ${quickFilter === "waiting" ? styles.filterPillActive : ""}`}
+              onClick={() => setQuickFilter((prev) => (prev === "waiting" ? "all" : "waiting"))}
+            >
+              ⏳ Waiting ({metrics.waiting})
+            </button>
+            <button
+              type="button"
+              className={`${styles.filterPill} ${quickFilter === "expired" ? styles.filterPillActive : ""}`}
+              onClick={() => setQuickFilter((prev) => (prev === "expired" ? "all" : "expired"))}
+            >
+              ⚠️ Expired Links
+            </button>
+          </div>
         </div>
 
         {error ? (
           <div className={styles.errorState} role="alert">
             <div>
               <strong>Couldn’t load recovery cases.</strong>
-              <span>
-                {error}
-              </span>
+              <span>{error}</span>
             </div>
-
             <button onClick={() => void loadCases()}>Try again</button>
           </div>
         ) : isLoading ? (
@@ -467,9 +810,12 @@ return (
         ) : cases.length === 0 ? (
           <div className={styles.emptyState}>
             <strong>No recovery cases yet</strong>
-            <span>
-              New cases from the recovery pipeline will appear here.
-            </span>
+            <span>New cases from the recovery pipeline will appear here.</span>
+          </div>
+        ) : filteredCases.length === 0 ? (
+          <div className={styles.emptyState}>
+            <strong>No matching recovery cases</strong>
+            <span>Try adjusting your search query or filter options.</span>
           </div>
         ) : (
           <div className={styles.tableWrap}>
@@ -481,14 +827,15 @@ return (
                   <th>Recovered</th>
                   <th>Status</th>
                   <th>AI decision</th>
+                  <th>Confidence</th>
+                  <th>Payment link</th>
                   <th>Attempts</th>
                   <th>AI reason</th>
                   <th>Action</th>
                 </tr>
               </thead>
-
               <tbody>
-                {cases.map((item) => {
+                {filteredCases.map((item) => {
                   const recovered = toNumber(
                     item.recovered_amount ?? item.amount_recovered,
                   );
@@ -554,6 +901,26 @@ return (
                       </td>
 
                       <td>
+                        {item.ai_confidence !== undefined && item.ai_confidence !== null ? (
+                          <strong style={{ fontSize: 12, color: "#1e293b", fontFamily: "monospace" }}>
+                            {Math.round(Number(item.ai_confidence) * 100)}%
+                          </strong>
+                        ) : (
+                          <span className={styles.muted}>—</span>
+                        )}
+                      </td>
+
+                      <td>
+                        <span
+                          className={`${styles.linkBadge} ${
+                            styles[`link-${item.payment_link_status || "not_created"}`]
+                          }`}
+                        >
+                          {readable(item.payment_link_status || "not_created")}
+                        </span>
+                      </td>
+
+                      <td>
                         <span className={styles.attempts}>
                           {item.attempt_count}
                         </span>
@@ -565,7 +932,14 @@ return (
                           "No reason recorded"}
                       </td>
 
-                                            <td>
+                      <td>
+                        <button
+                          className={styles.inspectBtn}
+                          onClick={() => void handleOpenInspect(item)}
+                          title="View case details & activity timeline"
+                        >
+                          Details
+                        </button>
                         {isWorking ? (
                           <button
                             className={styles.actionButton}
@@ -582,7 +956,7 @@ return (
                             className={styles.actionButton}
                             onClick={() => void runWorkflow(item.id)}
                           >
-                            Run AI Workflow
+                            Run AI
                           </button>
                         )}
                       </td>
@@ -595,6 +969,266 @@ return (
         )}
       </section>
     </section>
+
+    {inspectCase && (
+      <div className={styles.modalOverlay} onClick={handleCloseInspect}>
+        <div className={styles.drawer} onClick={(e) => e.stopPropagation()}>
+          <div className={styles.drawerHeader}>
+            <div>
+              <p className={styles.eyebrow}>Recovery Case</p>
+              <h3>Case {inspectCase.id.slice(0, 8)}…</h3>
+            </div>
+            <button className={styles.closeBtn} onClick={handleCloseInspect} aria-label="Close">
+              ✕
+            </button>
+          </div>
+
+          <div className={styles.drawerBody}>
+            <div className={styles.aiTransparencyBanner}>
+              <strong>Authoritative State Machine Invariant</strong>
+              <p>
+                AI recommendations analyze telemetry and automate customer outreach. A case transitions to <code>recovered</code> exclusively when a verified Razorpay payment webhook confirms settlement.
+              </p>
+            </div>
+
+            <div className={styles.flowStepper}>
+              <div className={`${styles.flowStep} ${styles.flowStepDone}`}>
+                <span className={`${styles.flowStepIcon} ${styles.flowStepDone}`}>✓</span>
+                <span>1. Failed Payment Recorded</span>
+              </div>
+              <div className={`${styles.flowStep} ${inspectCase.ai_decision ? styles.flowStepDone : styles.flowStepActive}`}>
+                <span className={`${styles.flowStepIcon} ${inspectCase.ai_decision ? styles.flowStepDone : styles.flowStepActive}`}>
+                  {inspectCase.ai_decision ? "✓" : "2"}
+                </span>
+                <span>
+                  2. AI Decision: {inspectCase.ai_decision ? readable(inspectCase.ai_decision).toUpperCase() : "Awaiting analysis"}
+                  {inspectCase.ai_confidence ? ` (${Math.round(Number(inspectCase.ai_confidence) * 100)}% conf)` : ""}
+                </span>
+              </div>
+              <div className={`${styles.flowStep} ${inspectCase.payment_link_status === "active" || inspectCase.payment_link_status === "paid" || inspectCase.payment_link_status === "expired" ? styles.flowStepDone : (inspectCase.scheduled_action ? styles.flowStepDone : styles.flowStepPending)}`}>
+                <span className={`${styles.flowStepIcon} ${inspectCase.payment_link_status !== "not_created" || inspectCase.scheduled_action ? styles.flowStepDone : styles.flowStepPending}`}>
+                  {inspectCase.payment_link_status !== "not_created" || inspectCase.scheduled_action ? "✓" : "3"}
+                </span>
+                <span>
+                  3. Recovery Action: {inspectCase.payment_link_status !== "not_created" ? `Link ${readable(inspectCase.payment_link_status || "created")}` : (inspectCase.scheduled_action ? `Wait scheduled` : "Pending")}
+                </span>
+              </div>
+              <div className={`${styles.flowStep} ${inspectCase.payment_link_status !== "not_created" ? styles.flowStepDone : styles.flowStepPending}`}>
+                <span className={`${styles.flowStepIcon} ${inspectCase.payment_link_status !== "not_created" ? styles.flowStepDone : styles.flowStepPending}`}>
+                  {inspectCase.payment_link_status !== "not_created" ? "✓" : "4"}
+                </span>
+                <span>4. Customer Outreach (Secure link emailed)</span>
+              </div>
+              <div className={`${styles.flowStep} ${inspectCase.status === "recovered" ? styles.flowStepDone : styles.flowStepPending}`}>
+                <span className={`${styles.flowStepIcon} ${inspectCase.status === "recovered" ? styles.flowStepDone : styles.flowStepPending}`}>
+                  {inspectCase.status === "recovered" ? "✓" : "5"}
+                </span>
+                <span>
+                  5. Settlement: {inspectCase.status === "recovered" ? "Verified via Razorpay Webhook" : "Waiting for customer payment"}
+                </span>
+              </div>
+            </div>
+
+            <div className={styles.drawerControls}>
+              <span className={styles.drawerControlsTitle}>Merchant Recovery Controls</span>
+              {drawerActionMessage && (
+                <div className={styles.agentSuccessMessage} style={{ margin: "4px 0", fontSize: 11 }}>
+                  {drawerActionMessage}
+                </div>
+              )}
+              <div className={styles.drawerButtonRow}>
+                <button
+                  className={`${styles.ctrlBtn} ${styles.ctrlBtnPrimary}`}
+                  onClick={() => void handleManualAnalyze(inspectCase.id)}
+                  disabled={isPerformingDrawerAction || inspectCase.status === "recovered" || inspectCase.status === "closed"}
+                  title="Run AI decision engine on this case now"
+                >
+                  Run AI Analysis Now
+                </button>
+                <button
+                  className={styles.ctrlBtn}
+                  onClick={() => void handleManualRetryLink(inspectCase.id)}
+                  disabled={isPerformingDrawerAction || inspectCase.status === "recovered" || inspectCase.status === "closed"}
+                  title="Generate or re-send payment link to customer"
+                >
+                  Send / Re-send Payment Link
+                </button>
+                <button
+                  className={`${styles.ctrlBtn} ${styles.ctrlBtnDanger}`}
+                  onClick={() => void handleManualClose(inspectCase.id)}
+                  disabled={isPerformingDrawerAction || inspectCase.status === "recovered" || inspectCase.status === "closed"}
+                  title="Close this recovery case"
+                >
+                  Close Case
+                </button>
+              </div>
+            </div>
+
+            <div className={styles.detailCard}>
+              <h4 className={styles.detailCardTitle}>Customer & Payment</h4>
+              <div className={styles.detailGrid}>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Customer</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.customer_name}</span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Email</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.customer_email || "None"}</span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Amount at Risk</span>
+                  <span className={styles.detailFieldValue}>{formatCurrency(toNumber(inspectCase.amount_at_risk))}</span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Amount Recovered</span>
+                  <span className={styles.detailFieldValue}>{formatCurrency(toNumber(inspectCase.recovered_amount ?? inspectCase.amount_recovered))}</span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Payment Status</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.payment_status}</span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Failure Reason</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.failure_reason || "None recorded"}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className={styles.detailCard}>
+              <h4 className={styles.detailCardTitle}>AI Recovery Assessment</h4>
+              <div className={styles.detailGrid}>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Decision</span>
+                  <span className={styles.detailFieldValue}>
+                    {inspectCase.ai_decision ? readable(inspectCase.ai_decision) : "Pending analysis"}
+                  </span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Confidence</span>
+                  <span className={styles.detailFieldValue}>
+                    {inspectCase.ai_confidence ? `${Math.round(Number(inspectCase.ai_confidence) * 100)}%` : "—"}
+                  </span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Attempt Count</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.attempt_count}</span>
+                </div>
+                <div className={styles.detailField} style={{ gridColumn: "span 2" }}>
+                  <span className={styles.detailFieldLabel}>Reasoning</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.ai_reason ?? inspectCase.ai_decision_note ?? "No note recorded"}</span>
+                </div>
+                {inspectCase.next_action_at && (
+                  <div className={styles.detailField} style={{ gridColumn: "span 2" }}>
+                    <span className={styles.detailFieldLabel}>Next Scheduled Follow-up</span>
+                    <span className={styles.detailFieldValue}>{formatTimestamp(inspectCase.next_action_at)} ({readable(inspectCase.scheduled_action ?? "action")})</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className={styles.detailCard}>
+              <h4 className={styles.detailCardTitle}>Payment Link Lifecycle</h4>
+              <div className={styles.detailGrid}>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>State</span>
+                  <span className={styles.detailFieldValue}>
+                    <span className={`${styles.linkBadge} ${styles['link-' + (inspectCase.payment_link_status || 'not_created')]}`}>
+                      {readable(inspectCase.payment_link_status || "not_created")}
+                    </span>
+                  </span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Link ID</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.razorpay_payment_link_id || "None created"}</span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Created At</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.payment_link_created_at ? formatTimestamp(inspectCase.payment_link_created_at) : "N/A"}</span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Sent At</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.payment_link_sent_at ? formatTimestamp(inspectCase.payment_link_sent_at) : "N/A"}</span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Expires At</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.payment_link_expires_at ? formatTimestamp(inspectCase.payment_link_expires_at) : "N/A"}</span>
+                </div>
+                <div className={styles.detailField}>
+                  <span className={styles.detailFieldLabel}>Paid At</span>
+                  <span className={styles.detailFieldValue}>{inspectCase.payment_link_paid_at ? formatTimestamp(inspectCase.payment_link_paid_at) : "N/A"}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className={styles.detailCard}>
+              <h4 className={styles.detailCardTitle}>Customer Notification History</h4>
+              {isLoadingActivity ? (
+                <p style={{ color: "#94a3b8", fontSize: 12 }}>Loading notification logs…</p>
+              ) : notificationLogs.length === 0 ? (
+                <p style={{ color: "#94a3b8", fontSize: 12 }}>No notification attempts recorded yet.</p>
+              ) : (
+                <div className={styles.notifList}>
+                  {notificationLogs.map((log) => {
+                    const isSuccess = log.action === "notification_sent";
+                    const recipient = (log.details?.recipient as string) || inspectCase.customer_email || "Customer";
+                    const reason = (log.details?.reason as string) || null;
+                    return (
+                      <div key={log.id} className={styles.notifCard}>
+                        <div className={styles.notifHeader}>
+                          <span className={`${styles.notifBadge} ${isSuccess ? styles.notifBadgeSent : styles.notifBadgeFailed}`}>
+                            {isSuccess ? "Delivered" : "Delivery Failed"}
+                          </span>
+                          <span className={styles.notifMeta}>{formatTimestamp(log.created_at)}</span>
+                        </div>
+                        <span className={styles.notifMeta}>To: {recipient} (Email)</span>
+                        {reason && (
+                          <span className={styles.notifReason}>Reason: {reason}</span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className={styles.detailCard}>
+              <h4 className={styles.detailCardTitle}>Activity Timeline</h4>
+              {isLoadingActivity ? (
+                <p style={{ color: "#94a3b8", fontSize: 12 }}>Loading timeline events…</p>
+              ) : activityLogs.length === 0 ? (
+                <p style={{ color: "#94a3b8", fontSize: 12 }}>No activity events recorded yet.</p>
+              ) : (
+                <div className={styles.timelineWrap}>
+                  {activityLogs.map((log) => {
+                    const info = getTimelineDetailsSummary(log.action, log.details);
+                    return (
+                      <div key={log.id} className={styles.timelineItem}>
+                        <span className={info.dotClass} />
+                        <div className={styles.timelineContent}>
+                          <div className={styles.timelineEventHeader}>
+                            <span className={styles.timelineTitle}>{info.title}</span>
+                            <span className={styles.timelineActorBadge}>{log.actor}</span>
+                          </div>
+                          <span className={styles.timelineTime}>{formatTimestamp(log.created_at)}</span>
+                          {info.summary && (
+                            <p className={styles.timelineSummaryText}>{info.summary}</p>
+                          )}
+                          {log.details && Object.keys(log.details).length > 0 && !info.summary && (
+                            <pre className={styles.timelineDetails}>
+                              {JSON.stringify(log.details, null, 2)}
+                            </pre>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    )}
   </main>
 );
 }

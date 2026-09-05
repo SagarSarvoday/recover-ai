@@ -17,8 +17,21 @@ CREATE TABLE merchants (
     ai_agent_enabled    BOOLEAN NOT NULL DEFAULT FALSE,
     ai_agent_started_at TIMESTAMPTZ,
     ai_agent_updated_at TIMESTAMPTZ,
+    business_name       TEXT,
+    support_email       TEXT,
+    support_phone       TEXT,
+    max_recovery_attempts INTEGER NOT NULL DEFAULT 3,
+    default_payment_link_expiry_hours INTEGER NOT NULL DEFAULT 48,
+    default_wait_minutes INTEGER NOT NULL DEFAULT 60,
+    auto_notify_customer BOOLEAN NOT NULL DEFAULT TRUE,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT merchants_max_recovery_attempts_chk
+        CHECK (max_recovery_attempts >= 1 AND max_recovery_attempts <= 5),
+    CONSTRAINT merchants_default_payment_link_expiry_hours_chk
+        CHECK (default_payment_link_expiry_hours >= 1 AND default_payment_link_expiry_hours <= 168),
+    CONSTRAINT merchants_default_wait_minutes_chk
+        CHECK (default_wait_minutes >= 15 AND default_wait_minutes <= 1440)
 );
 
 -- Compatibility merchant for the existing single-merchant development workflow.
@@ -42,6 +55,7 @@ CREATE TABLE customers (
     phone         TEXT,
     razorpay_customer_id TEXT,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT customers_merchant_email_key UNIQUE (merchant_id, email),
     CONSTRAINT customers_merchant_razorpay_customer_id_key
         UNIQUE (merchant_id, razorpay_customer_id)
@@ -121,8 +135,9 @@ CREATE TABLE recovery_cases (
     customer_id       UUID REFERENCES customers (id) ON DELETE SET NULL,
     payment_id        UUID NOT NULL UNIQUE REFERENCES payments (id) ON DELETE CASCADE,
     razorpay_payment_link_id TEXT UNIQUE,
+    payment_link_expires_at TIMESTAMPTZ,
     status            TEXT NOT NULL DEFAULT 'open'
-                      CHECK (status IN ('open', 'in_progress', 'recovered', 'closed')),
+                      CHECK (status IN ('open', 'in_progress', 'waiting', 'payment_link_active', 'recovered', 'closed')),
     amount_at_risk    NUMERIC(12, 2) NOT NULL CHECK (amount_at_risk >= 0),
     amount_recovered  NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (amount_recovered >= 0),
     attempt_count     INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
@@ -131,10 +146,14 @@ CREATE TABLE recovery_cases (
                           OR ai_decision IN ('retry', 'wait', 'contact', 'skip', 'close')
                       ),
     ai_decision_note  TEXT,
+    ai_confidence     NUMERIC(3, 2),
     ai_wait_minutes   INTEGER CHECK (ai_wait_minutes IS NULL OR ai_wait_minutes BETWEEN 1 AND 10080),
     next_action_at    TIMESTAMPTZ,
     scheduled_action  TEXT,
     last_attempt_at   TIMESTAMPTZ,
+    payment_link_created_at TIMESTAMPTZ,
+    payment_link_sent_at TIMESTAMPTZ,
+    payment_link_paid_at TIMESTAMPTZ,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -148,6 +167,8 @@ CREATE INDEX idx_recovery_cases_merchant_id ON recovery_cases (merchant_id);
 CREATE INDEX idx_recovery_cases_status ON recovery_cases (status);
 CREATE INDEX idx_recovery_cases_razorpay_payment_link_id
     ON recovery_cases (razorpay_payment_link_id);
+CREATE INDEX idx_recovery_cases_payment_link_expires_at
+    ON recovery_cases (payment_link_expires_at);
 
 -- ---------------------------------------------------------------------------
 -- scheduled_recovery_actions
@@ -212,3 +233,28 @@ CREATE TABLE razorpay_webhook_events (
 
 CREATE INDEX idx_razorpay_webhook_events_event_type
     ON razorpay_webhook_events (event_type);
+
+-- ---------------------------------------------------------------------------
+-- merchant_password_reset_tokens
+-- Stores cryptographically hashed, single-use, time-limited reset tokens.
+-- ---------------------------------------------------------------------------
+CREATE TABLE merchant_password_reset_tokens (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    merchant_id   UUID NOT NULL REFERENCES merchants (id) ON DELETE CASCADE,
+    token_hash    TEXT NOT NULL UNIQUE,
+    expires_at    TIMESTAMPTZ NOT NULL,
+    used_at       TIMESTAMPTZ,
+    requested_ip  TEXT,
+    user_agent    TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_merchant_password_reset_tokens_merchant_id
+    ON merchant_password_reset_tokens (merchant_id);
+
+CREATE INDEX idx_merchant_password_reset_tokens_token_hash
+    ON merchant_password_reset_tokens (token_hash);
+
+CREATE INDEX idx_merchant_password_reset_tokens_expires_at
+    ON merchant_password_reset_tokens (expires_at);
+
