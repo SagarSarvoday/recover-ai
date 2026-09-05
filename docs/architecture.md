@@ -10,58 +10,39 @@ RecoverAI is structured as an autonomous, event-driven recovery engine composed 
 
 ```mermaid
 flowchart TD
-    subgraph External Systems
-        RZP[Razorpay Payment Gateway]
-        CUST[End Customer]
-        SMTP[SMTP Mail Server]
-        LLM[Ollama / Local LLM Engine]
-    end
+    Merchant["Merchant"] --> Dashboard["Next.js Merchant Dashboard"]
+    Dashboard --> FastAPI["FastAPI REST API"]
+    FastAPI --> Auth["Authentication/JWT"]
+    Auth --> PostgreSQL["PostgreSQL"]
+    FastAPI --> PostgreSQL
+    PostgreSQL --> AuditLogs["Audit Logs"]
+    PostgreSQL --> TenantIsolation["Merchant/Tenant Isolation"]
 
-    subgraph RecoverAI Platform
-        subgraph Ingestion & Security
-            WH[Webhook Ingestion\nPOST /api/v1/webhooks/razorpay]
-            HMAC[HMAC-SHA256 Signature Verification]
-            IDEM[Webhook Idempotency Layer]
-        end
+    Customer["Customer"] --> Razorpay["Razorpay"]
 
-        subgraph Core Engine
-            RC[Recovery Case Manager]
-            SM[Recovery State Machine]
-            AIE[AI Decision Engine & Guardrails]
-            RA[Recovery Action Executor]
-        end
+    Razorpay -->|payment.failed| WebhookHandler["Webhook Handler"]
+    WebhookHandler --> WebhookVerification["Webhook Signature Verification"]
+    WebhookVerification --> RecoveryCase["Recovery Case"]
 
-        subgraph Background Workers
-            CAW[Continuous Agent Worker\nDaemon Thread (10s)]
-            SRAW[Scheduled Recovery Worker\nDaemon Thread (15s)]
-        end
+    RecoveryCase --> AIDecisionEngine["AI Recovery Decision Engine"]
+    AIDecisionEngine --> ServerGuardrails["Server Guardrails"]
+    ServerGuardrails --> ActionDispatcher["Recovery Action Dispatcher"]
 
-        subgraph Database & Persistence
-            DB[(PostgreSQL / Supabase)]
-        end
+    ActionDispatcher -->|retry| PaymentLink["Razorpay Payment Link"]
+    PaymentLink --> Customer
 
-        subgraph Merchant Experience
-            API[FastAPI REST API v1]
-            FE[Next.js 15 Merchant Dashboard]
-        end
-    end
+    ActionDispatcher -->|contact| CustomerEmail["Branded Customer Email"]
+    CustomerEmail --> Customer
 
-    RZP -->|payment.failed webhook| WH
-    WH --> HMAC --> IDEM --> RC
-    RC --> DB
-    CAW -->|Poll unhandled open cases| RC
-    SRAW -->|Poll due wait jobs| DB
-    RC --> AIE
-    AIE <-->|Prompt / JSON Decision| LLM
-    AIE -->|Guarded Decision| RA
-    RA -->|Create Payment Link| RZP
-    RA -->|Send Recovery Email| SMTP
-    SMTP -->|Email with Recovery Link| CUST
-    CUST -->|Click Link & Pay| RZP
-    RZP -->|payment_link.paid webhook| WH
-    WH -->|Settle & Recover| SM
-    FE <-->|JWT Authenticated REST| API
-    API <--> DB
+    ActionDispatcher -->|wait| RecoveryWorker["Background Recovery Worker"]
+    RecoveryWorker --> RecoveryCase
+
+    Customer -->|successful payment| Razorpay
+    Razorpay -->|payment_link.paid| WebhookHandler
+    WebhookHandler -->|verified payment| CaseRecovered["Case = Recovered"]
+
+    style AIDecisionEngine fill:#2563eb,stroke:#1d4ed8,stroke-width:3px,color:#ffffff
+    style CaseRecovered fill:#16a34a,stroke:#15803d,stroke-width:2px,color:#ffffff
 ```
 
 ---
