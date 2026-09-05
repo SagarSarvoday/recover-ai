@@ -87,14 +87,20 @@ class RecoveryActionTests(unittest.TestCase):
             phone="9876543210",
         )
         self.db = FakeSession(self.case, self.payment, self.customer)
-        self.context = RecoveryActionExecutionContext(db=self.db, max_recovery_attempts=3)
+        self.razorpay_service = FakeRazorpayService()
+        self.context = RecoveryActionExecutionContext(
+            db=self.db,
+            max_recovery_attempts=3,
+            razorpay_service=self.razorpay_service,
+        )
 
     def test_allowed_retry(self) -> None:
         result = execute_recovery_action("retry", self.case_id, self.context)
 
         self.assertTrue(result.success)
         self.assertEqual(result.action, "retry_payment")
-        self.assertEqual(len(self.db.audit_logs), 1)
+        action_logs = [log for log in self.db.audit_logs if getattr(log, "action", None) == "recovery_action_retry_payment"]
+        self.assertEqual(len(action_logs), 1)
 
     def test_retry_is_blocked_at_max_attempts(self) -> None:
         self.case.attempt_count = 3
@@ -163,7 +169,8 @@ class RecoveryActionTests(unittest.TestCase):
         self.assertEqual(self.case.attempt_count, 1)
         self.assertEqual(self.case.status, "in_progress")
         self.assertIsNotNone(self.case.last_attempt_at)
-        self.assertEqual(self.db.audit_logs[0].details["simulated"], False)
+        action_log = next(log for log in self.db.audit_logs if getattr(log, "action", None) == "recovery_action_create_payment_link")
+        self.assertEqual(action_log.details["simulated"], False)
 
     def test_contact_uses_only_outstanding_amount_in_paise(self) -> None:
         self.case.amount_recovered = Decimal("149.00")

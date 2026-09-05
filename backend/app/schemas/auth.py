@@ -54,3 +54,40 @@ class AuthenticatedMerchantResponse(BaseModel):
 class AccessTokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+
+
+class ForgotPasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=3, max_length=254)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if "@" not in normalized:
+            raise ValueError("A valid email address is required.")
+        return normalized
+
+
+class ForgotPasswordResponse(BaseModel):
+    message: str = "If an account exists for this email, you will receive a password reset link shortly."
+
+
+class ResetPasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str = Field(min_length=1)
+    new_password: str = Field(min_length=8, max_length=256)
+
+    @field_validator("token")
+    @classmethod
+    def validate_token(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("Reset token is required.")
+        return trimmed
+
+
+class ResetPasswordResponse(BaseModel):
+    message: str = "Password has been successfully reset. You can now log in with your new password."

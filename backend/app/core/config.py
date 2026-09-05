@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     jwt_secret_key: SecretStr | None = None
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = Field(default=60, ge=1, le=1440)
+    email_enabled: bool = False
+    smtp_host: str = "localhost"
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = None
+    smtp_use_tls: bool = True
+    email_from: str = "RecoverAI <noreply@recoverai.local>"
+    frontend_base_url: str = "http://localhost:3000"
+    password_reset_token_expire_minutes: int = Field(default=20, ge=5, le=60)
 
     @property
     def cors_origin_list(self) -> list[str]:

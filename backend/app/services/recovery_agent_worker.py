@@ -148,10 +148,15 @@ def find_eligible_cases_for_merchant(
             skipped.append((case.id, "active_schedule_exists"))
             continue
 
-        # Check if case has an active payment link awaiting customer payment via webhook
+        # Check if case has an active, unexpired payment link awaiting customer payment via webhook
         if case.razorpay_payment_link_id is not None:
-            skipped.append((case.id, "awaiting_payment_link_webhook"))
-            continue
+            link_expires = getattr(case, "payment_link_expires_at", None)
+            if link_expires is not None and link_expires.tzinfo is None:
+                link_expires = link_expires.replace(tzinfo=timezone.utc)
+            is_link_active = link_expires is None or link_expires > now
+            if is_link_active:
+                skipped.append((case.id, "awaiting_payment_link_webhook"))
+                continue
 
         # Check if case was already analyzed and is within cooldown
         if case.attempt_count > 0 or case.ai_decision is not None:

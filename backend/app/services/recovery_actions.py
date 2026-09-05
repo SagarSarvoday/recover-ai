@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.audit_log import AuditLog
 from app.models.customer import Customer
+from app.models.merchant import Merchant
 from app.models.payment import Payment
 from app.models.recovery_case import RecoveryCase
 from app.models.scheduled_recovery_action import ScheduledRecoveryAction
@@ -26,7 +27,9 @@ from app.schemas.recovery_actions import (
     SendRecoveryMessageInput,
     StopRecoveryInput,
 )
+from app.services.notification_service import NotificationService
 from app.services.razorpay_service import RazorpayService
+from app.services.recovery_state_machine import transition_case_status
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,7 @@ class RecoveryActionExecutionContext:
     action_context: RecoveryActionContext = field(default_factory=RecoveryActionContext)
     actor: str = "recovery_action_dispatcher"
     razorpay_service: RazorpayService | None = None
+    notification_service: NotificationService | None = None
 
 
 def _record_action_attempt(
@@ -160,91 +164,10 @@ def _execute_simulated_tool(
     return result
 
 
-def retry_payment(
-    tool_input: RetryPaymentInput,
+def _execute_payment_link_and_notify(
+    tool_input: RecoveryToolInput,
     execution_context: RecoveryActionExecutionContext,
-) -> ActionResult:
-    db = execution_context.db
-
-    case, guardrails, blocked_message = _validate_case(
-        db,
-        tool_input.case_id,
-        execution_context.max_recovery_attempts,
-        requires_attempt_capacity=True,
-    )
-
-    if blocked_message is not None or case is None:
-        result = ActionResult(
-            case_id=tool_input.case_id,
-            action="retry_payment",
-            success=False,
-            outcome="blocked",
-            amount_recovered=Decimal("0.00"),
-            message=blocked_message or "Recovery case could not be processed.",
-            guardrails_applied=guardrails,
-        )
-
-        _record_action_attempt(
-            db,
-            result,
-            tool_input.context,
-            execution_context.actor,
-        )
-
-        return result
-
-    payment = db.get(Payment, case.payment_id)
-
-    if payment is None:
-        result = ActionResult(
-            case_id=tool_input.case_id,
-            action="retry_payment",
-            success=False,
-            outcome="blocked",
-            amount_recovered=Decimal("0.00"),
-            message="Payment information is missing.",
-            guardrails_applied=["required_payment_information_missing"],
-        )
-
-        _record_action_attempt(
-            db,
-            result,
-            tool_input.context,
-            execution_context.actor,
-        )
-
-        return result
-
-    # Record that a recovery attempt was made.
-    case.attempt_count += 1
-    case.last_attempt_at = datetime.now(timezone.utc)
-    case.status = "in_progress"
-
-        # Simulated retry: a retry attempt does not itself confirm payment success.
-    # Successful recovery is confirmed only by the payment-success webhook.
-    result = ActionResult(
-        case_id=tool_input.case_id,
-        action="retry_payment",
-        success=False,
-        outcome="failed",
-        amount_recovered=Decimal("0.00"),
-        message="Simulated payment retry failed; awaiting payment confirmation.",
-        guardrails_applied=guardrails,
-    )
-
-    _record_action_attempt(
-        db,
-        result,
-        tool_input.context,
-        execution_context.actor,
-    )
-
-    return result
-
-
-def create_payment_link(
-    tool_input: CreatePaymentLinkInput,
-    execution_context: RecoveryActionExecutionContext,
+    tool_action: RecoveryToolAction,
 ) -> ActionResult:
     db = execution_context.db
     case, guardrails, blocked_message = _validate_case(
@@ -256,7 +179,7 @@ def create_payment_link(
     if blocked_message is not None or case is None:
         result = ActionResult(
             case_id=tool_input.case_id,
-            action="create_payment_link",
+            action=tool_action,
             status="failed",
             success=False,
             outcome="blocked",
@@ -267,34 +190,11 @@ def create_payment_link(
         _record_action_attempt(db, result, tool_input.context, execution_context.actor, simulated=False)
         return result
 
-    existing_payment_link_id = getattr(case, "razorpay_payment_link_id", None)
-    if existing_payment_link_id:
-        result = ActionResult(
-            case_id=case.id,
-            action="create_payment_link",
-            status="completed",
-            success=True,
-            outcome="scheduled",
-            amount_recovered=Decimal("0.00"),
-            message="An active Razorpay payment link already exists for this recovery case.",
-            guardrails_applied=["existing_payment_link_reused"],
-            payment_link_id=existing_payment_link_id,
-        )
-        _record_action_attempt(
-            db,
-            result,
-            tool_input.context,
-            execution_context.actor,
-            simulated=False,
-            metadata={"razorpay_payment_link_id": existing_payment_link_id},
-        )
-        return result
-
-    customer = db.get(Customer, case.customer_id)
+    customer = db.get(Customer, case.customer_id) if case.customer_id else None
     if customer is None:
         result = ActionResult(
             case_id=case.id,
-            action="create_payment_link",
+            action=tool_action,
             status="failed",
             success=False,
             outcome="blocked",
@@ -305,18 +205,18 @@ def create_payment_link(
         _record_action_attempt(db, result, tool_input.context, execution_context.actor, simulated=False)
         return result
 
-    customer_email = _usable_contact_value(getattr(customer, "email", None))
-    customer_phone = _usable_contact_value(getattr(customer, "phone", None))
-    if customer_email is None and customer_phone is None:
+    cust_merchant_id = getattr(customer, "merchant_id", None)
+    case_merchant_id = getattr(case, "merchant_id", None)
+    if cust_merchant_id is not None and case_merchant_id is not None and cust_merchant_id != case_merchant_id:
         result = ActionResult(
             case_id=case.id,
-            action="create_payment_link",
+            action=tool_action,
             status="failed",
             success=False,
             outcome="blocked",
             amount_recovered=Decimal("0.00"),
-            message="Customer contact information is unavailable for payment-link delivery.",
-            guardrails_applied=["customer_contact_information_missing"],
+            message="Customer does not belong to the merchant for this recovery case.",
+            guardrails_applied=["customer_merchant_mismatch"],
         )
         _record_action_attempt(db, result, tool_input.context, execution_context.actor, simulated=False)
         return result
@@ -325,7 +225,7 @@ def create_payment_link(
     if payment is None:
         result = ActionResult(
             case_id=case.id,
-            action="create_payment_link",
+            action=tool_action,
             status="failed",
             success=False,
             outcome="blocked",
@@ -336,12 +236,28 @@ def create_payment_link(
         _record_action_attempt(db, result, tool_input.context, execution_context.actor, simulated=False)
         return result
 
+    pay_cust_id = getattr(payment, "customer_id", None)
+    cust_id = getattr(customer, "id", None)
+    if pay_cust_id is not None and cust_id is not None and pay_cust_id != cust_id:
+        result = ActionResult(
+            case_id=case.id,
+            action=tool_action,
+            status="failed",
+            success=False,
+            outcome="blocked",
+            amount_recovered=Decimal("0.00"),
+            message="Payment customer does not match recovery case customer.",
+            guardrails_applied=["customer_payment_mismatch"],
+        )
+        _record_action_attempt(db, result, tool_input.context, execution_context.actor, simulated=False)
+        return result
+
     recovered_amount = min(max(case.amount_recovered, Decimal("0.00")), case.amount_at_risk)
     outstanding_amount = max(Decimal("0.00"), case.amount_at_risk - recovered_amount)
     if outstanding_amount == Decimal("0.00"):
         result = ActionResult(
             case_id=case.id,
-            action="create_payment_link",
+            action=tool_action,
             status="failed",
             success=False,
             outcome="blocked",
@@ -352,8 +268,102 @@ def create_payment_link(
         _record_action_attempt(db, result, tool_input.context, execution_context.actor, simulated=False)
         return result
 
-    # Database amounts use two decimal places, so this conversion is exact for INR.
+    merchant = db.get(Merchant, case.merchant_id) if getattr(case, "merchant_id", None) else None
+    expiry_hours = getattr(merchant, "default_payment_link_expiry_hours", None) or 48
+    notification_service = execution_context.notification_service or NotificationService(settings)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(hours=int(expiry_hours))
+    existing_payment_link_id = getattr(case, "razorpay_payment_link_id", None)
+    existing_expires_at = getattr(case, "payment_link_expires_at", None)
+    if existing_expires_at is not None and existing_expires_at.tzinfo is None:
+        existing_expires_at = existing_expires_at.replace(tzinfo=timezone.utc)
+
+    is_link_active = bool(
+        existing_payment_link_id and (existing_expires_at is None or existing_expires_at > now)
+    )
+
+    if is_link_active:
+        payment_link_id = existing_payment_link_id
+        payment_link_url = f"https://rzp.io/i/{existing_payment_link_id}"
+
+        notif_result = notification_service.send_recovery_payment_email(
+            customer=customer,
+            payment=payment,
+            payment_link=payment_link_url,
+            expires_at=existing_expires_at or expires_at,
+            merchant=merchant,
+            db=db,
+            recovery_case=case,
+            actor=execution_context.actor,
+        )
+
+        guardrails_applied = ["existing_payment_link_reused"]
+        if not notif_result.success and notif_result.reason and notif_result.reason != "email_disabled":
+            guardrails_applied.append(notif_result.reason)
+
+        action_label = "payment retry link" if tool_action == "retry_payment" else "payment link"
+        if notif_result.success:
+            msg = f"Active Razorpay {action_label} reused and sent to customer; awaiting payment confirmation."
+        elif notif_result.status == "email_disabled":
+            msg = f"Active Razorpay {action_label} reused (email delivery disabled); awaiting payment confirmation."
+        else:
+            msg = f"Active Razorpay {action_label} reused, but notification failed ({notif_result.reason}); awaiting payment confirmation."
+
+        case.payment_link_sent_at = now
+        transition_case_status(
+            case,
+            "payment_link_active",
+            db=db,
+            reason="payment_link_reused",
+            actor=execution_context.actor,
+        )
+        db.commit()
+
+        result = ActionResult(
+            case_id=case.id,
+            action=tool_action,
+            status="completed",
+            success=True,
+            outcome="scheduled",
+            amount_recovered=Decimal("0.00"),
+            message=msg,
+            guardrails_applied=guardrails_applied,
+            payment_link_id=payment_link_id,
+            payment_link_url=payment_link_url,
+        )
+        _record_action_attempt(
+            db,
+            result,
+            tool_input.context,
+            execution_context.actor,
+            simulated=False,
+            metadata={
+                "razorpay_payment_link_id": payment_link_id,
+                "payment_link_url": payment_link_url,
+                "notification_channel": "email",
+                "notification_status": notif_result.status,
+            },
+        )
+        return result
+
+    customer_email = _usable_contact_value(getattr(customer, "email", None))
+    customer_phone = _usable_contact_value(getattr(customer, "phone", None))
+    if customer_email is None and customer_phone is None:
+        result = ActionResult(
+            case_id=case.id,
+            action=tool_action,
+            status="failed",
+            success=False,
+            outcome="blocked",
+            amount_recovered=Decimal("0.00"),
+            message="Customer contact information is unavailable for payment-link delivery.",
+            guardrails_applied=["customer_contact_information_missing"],
+        )
+        _record_action_attempt(db, result, tool_input.context, execution_context.actor, simulated=False)
+        return result
+
     amount_in_paise = int((outstanding_amount * Decimal("100")).to_integral_value())
+    expire_by = int(expires_at.timestamp())
     request = RazorpayPaymentLinkRequest(
         amount=amount_in_paise,
         currency=payment.currency,
@@ -362,6 +372,7 @@ def create_payment_link(
         customer_name=customer.name,
         customer_email=customer_email,
         customer_contact=customer_phone,
+        expire_by=expire_by,
     )
     razorpay_service = execution_context.razorpay_service or RazorpayService(settings)
     try:
@@ -374,7 +385,7 @@ def create_payment_link(
         )
         result = ActionResult(
             case_id=case.id,
-            action="create_payment_link",
+            action=tool_action,
             status="failed",
             success=False,
             outcome="failed",
@@ -386,33 +397,67 @@ def create_payment_link(
         return result
 
     case.razorpay_payment_link_id = payment_link.id
+    case.payment_link_expires_at = expires_at
+    case.payment_link_created_at = now
+    case.payment_link_sent_at = now
     case.attempt_count += 1
-    case.last_attempt_at = datetime.now(timezone.utc)
-    case.status = "in_progress"
-    link_message = "Razorpay Test Mode payment link created for the outstanding recovery amount."
-    if payment_link.short_url:
-        link_message = f"{link_message} {payment_link.short_url}"
-    logger.info(
-        "Created Razorpay payment link for recovery case %s: payment_link_id=%s amount_paise=%s",
-        case.id,
-        payment_link.id,
-        amount_in_paise,
+    case.last_attempt_at = now
+    transition_case_status(
+        case,
+        "payment_link_active",
+        db=db,
+        reason="payment_link_created",
+        actor=execution_context.actor,
     )
+    db.commit()
+
+    payment_link_id = payment_link.id
+    payment_link_url = payment_link.short_url or f"https://rzp.io/i/{payment_link.id}"
+
+    notif_result = notification_service.send_recovery_payment_email(
+        customer=customer,
+        payment=payment,
+        payment_link=payment_link_url,
+        expires_at=expires_at,
+        merchant=merchant,
+        db=db,
+        recovery_case=case,
+        actor=execution_context.actor,
+    )
+
+    guardrails_applied = []
+    if not notif_result.success and notif_result.reason and notif_result.reason != "email_disabled":
+        guardrails_applied.append(notif_result.reason)
+
+    action_label = "payment retry link" if tool_action == "retry_payment" else "payment link"
+    if notif_result.success:
+        msg = f"Razorpay {action_label} created and sent to customer; awaiting payment confirmation."
+    elif notif_result.status == "email_disabled":
+        msg = f"Razorpay {action_label} created (email delivery disabled); awaiting payment confirmation."
+    else:
+        msg = f"Razorpay {action_label} created, but notification failed ({notif_result.reason}); awaiting payment confirmation."
+
+    if payment_link.short_url:
+        msg = f"{msg} {payment_link.short_url}"
+
     result = ActionResult(
         case_id=case.id,
-        action="create_payment_link",
+        action=tool_action,
         status="completed",
         success=True,
         outcome="scheduled",
         amount_recovered=Decimal("0.00"),
-        message=link_message,
-        guardrails_applied=[],
-        payment_link_id=payment_link.id,
-        payment_link_url=payment_link.short_url,
+        message=msg,
+        guardrails_applied=guardrails_applied,
+        payment_link_id=payment_link_id,
+        payment_link_url=payment_link_url,
     )
-    audit_metadata = {"razorpay_payment_link_id": payment_link.id}
-    if payment_link.short_url:
-        audit_metadata["payment_link_url"] = payment_link.short_url
+    audit_metadata = {
+        "razorpay_payment_link_id": payment_link_id,
+        "payment_link_url": payment_link_url,
+        "notification_channel": "email",
+        "notification_status": notif_result.status,
+    }
     _record_action_attempt(
         db,
         result,
@@ -422,6 +467,20 @@ def create_payment_link(
         metadata=audit_metadata,
     )
     return result
+
+
+def retry_payment(
+    tool_input: RetryPaymentInput,
+    execution_context: RecoveryActionExecutionContext,
+) -> ActionResult:
+    return _execute_payment_link_and_notify(tool_input, execution_context, "retry_payment")
+
+
+def create_payment_link(
+    tool_input: CreatePaymentLinkInput,
+    execution_context: RecoveryActionExecutionContext,
+) -> ActionResult:
+    return _execute_payment_link_and_notify(tool_input, execution_context, "create_payment_link")
 
 
 def send_recovery_message(
@@ -489,6 +548,13 @@ def schedule_followup(
         scheduled_at = existing.scheduled_at
     case.next_action_at = scheduled_at
     case.scheduled_action = "retry"
+    transition_case_status(
+        case,
+        "waiting",
+        db=db,
+        reason="wait_scheduled",
+        actor=execution_context.actor,
+    )
     result = ActionResult(
         case_id=case.id, action="schedule_followup", status="completed", success=True, outcome="scheduled",
         amount_recovered=Decimal("0.00"),
@@ -505,7 +571,13 @@ def stop_recovery(
     execution_context: RecoveryActionExecutionContext,
 ) -> ActionResult:
     def close_case(case: RecoveryCase) -> None:
-        case.status = "closed"
+        transition_case_status(
+            case,
+            "closed",
+            db=execution_context.db,
+            reason="stop_recovery",
+            actor=execution_context.actor,
+        )
         case.ai_decision = "close"
         case.ai_decision_note = "Recovery stopped by the deterministic action dispatcher."
 

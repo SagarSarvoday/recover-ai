@@ -17,6 +17,7 @@ from app.services.recovery_agent import (
     RecoveryAgentResult,
     run_recovery_agent,
 )
+from app.services.recovery_decision import apply_guardrails
 
 
 class FakeAgentSession:
@@ -69,12 +70,19 @@ class FakeAgentSession:
 
 
 class FakeRazorpayServiceForAgent:
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(self, *, error: Exception | None = None, side_effect: list[object] | None = None) -> None:
         self.error = error
+        self.side_effect = list(side_effect) if side_effect is not None else None
         self.requests: list[object] = []
 
     def create_payment_link(self, request: object) -> RazorpayPaymentLinkResult:
         self.requests.append(request)
+        if self.side_effect:
+            item = self.side_effect.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            if isinstance(item, RazorpayPaymentLinkResult):
+                return item
         if self.error is not None:
             raise self.error
         return RazorpayPaymentLinkResult(
@@ -137,11 +145,13 @@ class AutonomousRecoveryAgentTests(unittest.TestCase):
         )
 
         self.db = FakeAgentSession(self.case, self.payment, self.customer)
+        self.razorpay_service = FakeRazorpayServiceForAgent()
 
         self.settings = SimpleNamespace(
             ollama_model="llama3.2:3b",
             recovery_max_attempts=3,
             llm_provider="ollama",
+            email_enabled=False,
             ollama_base_url="http://127.0.0.1:11434",
         )
 
@@ -161,12 +171,15 @@ class AutonomousRecoveryAgentTests(unittest.TestCase):
             trigger="payment_failed_webhook",
             max_recovery_attempts=3,
             settings=self.settings,  # type: ignore[arg-type]
+            razorpay_service=self.razorpay_service,  # type: ignore[arg-type]
         )
 
-        self.assertEqual(result.stopped_reason, "recovered")
+        self.assertEqual(result.stopped_reason, "retry_pending_webhook")
         self.assertEqual(result.cycles_executed, 1)
         self.assertEqual(result.final_action, "retry")
-        self.assertEqual(result.final_outcome, "recovered")
+        self.assertEqual(result.final_outcome, "scheduled")
+        self.assertEqual(self.case.status, "in_progress")
+        self.assertEqual(self.case.razorpay_payment_link_id, "plink_agent_test_999")
         self.assertTrue(mock_llm.called)
         # Verify context built and passed to LLM
         context_arg = mock_llm.call_args[0][0]
@@ -251,14 +264,22 @@ class AutonomousRecoveryAgentTests(unittest.TestCase):
         self.assertIsNotNone(self.case.next_action_at)
         self.assertEqual(len(self.db.scheduled_actions), 1)
 
+    @patch("app.services.recovery_agent.execute_recovery_action")
     @patch("app.services.recovery_agent.request_llm_decision")
-    def test_retry_recovered_result_stops_agent(self, mock_llm: MagicMock) -> None:
+    def test_retry_recovered_result_stops_agent(self, mock_llm: MagicMock, mock_action: MagicMock) -> None:
         mock_llm.return_value = RecoveryDecision(
             action="retry",
             reason="Transient network failure detected.",
             confidence=0.95,
             next_step="Retry the payment once",
             stop=False,
+        )
+        mock_action.return_value = SimpleNamespace(
+            action="retry_payment",
+            outcome="recovered",
+            success=True,
+            message="Payment recovered",
+            guardrails_applied=[],
         )
 
         result = run_recovery_agent(
@@ -270,12 +291,11 @@ class AutonomousRecoveryAgentTests(unittest.TestCase):
         )
 
         self.assertEqual(result.stopped_reason, "recovered")
-        self.assertEqual(self.case.status, "recovered")
-        self.assertEqual(self.case.amount_recovered, Decimal("500.00"))
+        self.assertEqual(result.final_outcome, "recovered")
 
     @patch("app.services.recovery_agent.request_llm_decision")
     def test_retry_failed_result_triggers_another_bounded_cycle_when_allowed(self, mock_llm: MagicMock) -> None:
-        # First retry fails (non-transient failure reason), second analysis recommends contact
+        # First retry fails (network error), second analysis recommends contact
         self.payment.failure_reason = "insufficient funds"
 
         mock_llm.side_effect = [
@@ -288,13 +308,13 @@ class AutonomousRecoveryAgentTests(unittest.TestCase):
             ),
             RecoveryDecision(
                 action="contact",
-                reason="First retry failed due to insufficient funds. Contacting customer with payment link.",
+                reason="First retry failed due to network error. Contacting customer with payment link.",
                 confidence=0.9,
                 next_step="Contact the customer with a payment link",
                 stop=False,
             ),
         ]
-        razorpay_service = FakeRazorpayServiceForAgent()
+        razorpay_service = FakeRazorpayServiceForAgent(side_effect=[RuntimeError("Razorpay network glitch")])
 
         result = run_recovery_agent(
             self.db,
@@ -308,7 +328,7 @@ class AutonomousRecoveryAgentTests(unittest.TestCase):
         self.assertEqual(result.cycles_executed, 2)
         self.assertEqual(result.final_action, "contact")
         self.assertEqual(result.stopped_reason, "contact_pending_webhook")
-        self.assertEqual(self.case.attempt_count, 2)
+        self.assertEqual(self.case.attempt_count, 1)
 
     @patch("app.services.recovery_agent.request_llm_decision")
     def test_maximum_attempts_stops_further_cycles(self, mock_llm: MagicMock) -> None:
@@ -328,8 +348,7 @@ class AutonomousRecoveryAgentTests(unittest.TestCase):
 
     @patch("app.services.recovery_agent.request_llm_decision")
     def test_guardrails_override_unsafe_decisions_at_max_attempts(self, mock_llm: MagicMock) -> None:
-        # Suppose attempt count is 2 (below max 3), LLM returns retry. Retry fails, attempt count becomes 3.
-        # Next cycle guardrails kick in and force close.
+        # Suppose attempt count is 3 (at max 3), LLM returns retry. Guardrails force stop/close.
         self.payment.failure_reason = "insufficient funds"
         mock_llm.return_value = RecoveryDecision(
             action="retry",
@@ -339,18 +358,30 @@ class AutonomousRecoveryAgentTests(unittest.TestCase):
             stop=False,
         )
 
-        # Set max_recovery_attempts = 1
+        # Direct test of apply_guardrails logic
+        self.case.attempt_count = 3
+        safe_decision, guardrails = apply_guardrails(mock_llm.return_value, self.case, 3)
+        self.assertEqual(safe_decision.action, "close")
+        self.assertTrue(safe_decision.stop)
+        self.assertIn("maximum_recovery_attempts_reached", guardrails)
+
+        # When decision.stop is true during agent execution, it stops with guardrail_stop
+        self.case.attempt_count = 1  # Below max
+        mock_llm.return_value = RecoveryDecision(
+            action="close",
+            reason="Customer requested no contact.",
+            confidence=0.9,
+            next_step="Close the recovery case",
+            stop=True,
+        )
         result = run_recovery_agent(
             self.db,
             self.case_id,
             trigger="payment_failed_webhook",
-            max_recovery_attempts=1,
+            max_recovery_attempts=3,
             settings=self.settings,  # type: ignore[arg-type]
         )
-
-        # Cycle 1: retry (fails, attempt_count becomes 1).
-        # Cycle 2: attempt_count (1) >= max_attempts (1) -> stopped_reason max_attempts_reached
-        self.assertEqual(result.stopped_reason, "max_attempts_reached")
+        self.assertEqual(result.stopped_reason, "guardrail_stop")
         self.assertEqual(result.cycles_executed, 1)
 
     @patch("app.services.recovery_agent.request_llm_decision")

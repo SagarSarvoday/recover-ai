@@ -1,3 +1,5 @@
+import hashlib
+import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -31,6 +33,16 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, stored_hash: str | None) -> bool:
     return stored_hash is not None and password_hash.verify(password, stored_hash)
+
+
+def hash_reset_token(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+def generate_password_reset_token() -> tuple[str, str]:
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hash_reset_token(raw_token)
+    return raw_token, token_hash
 
 
 def create_access_token(merchant_id: UUID) -> str:

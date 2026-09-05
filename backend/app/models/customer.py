@@ -32,6 +32,9 @@ class Customer(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
 
     merchant: Mapped["Merchant"] = relationship(back_populates="customers")
     transactions: Mapped[list["Transaction"]] = relationship(back_populates="customer")

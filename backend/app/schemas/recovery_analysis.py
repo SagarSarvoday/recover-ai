@@ -71,6 +71,20 @@ class RecoveryDecisionContext(BaseModel):
     previous_recovery_outcomes: list[PreviousRecoveryOutcome]
     previous_recovery_attempts: list[RecoveryAttemptItem]
 
+    # Scheduling and lifecycle context (prevents infinite wait loops and duplicate links)
+    trigger: str = "manual"
+    is_scheduled_followup: bool = False
+    scheduled_action: str | None = None
+    scheduled_at: datetime | None = None
+    current_time: datetime | None = None
+    is_scheduled_due: bool = False
+    wait_elapsed: bool = False
+    active_payment_link_id: str | None = None
+    payment_link_expires_at: datetime | None = None
+    is_payment_link_expired: bool = False
+    last_notification_status: str | None = None
+    last_notification_failure_reason: str | None = None
+
 
 class RecoveryAnalysisResponse(BaseModel):
     case_id: UUID

@@ -163,7 +163,9 @@ def run_recovery_agent(
                 stopped_reason="payment_not_found", ai_reasoning=None,
             )
 
-        context = build_recovery_context(db, case, customer, payment, max_recovery_attempts)
+        context = build_recovery_context(
+            db, case, customer, payment, max_recovery_attempts, trigger=trigger
+        )
 
         # ── THINK ───────────────────────────────────────────────────
         try:
@@ -188,7 +190,7 @@ def run_recovery_agent(
 
         # ── GUARD ───────────────────────────────────────────────────
         decision, guardrails_applied = apply_guardrails(
-            llm_decision, case, max_recovery_attempts,
+            llm_decision, case, max_recovery_attempts, context=context
         )
         ai_reasoning = decision.reason
 
@@ -216,7 +218,13 @@ def run_recovery_agent(
                 trigger=trigger, cycle=cycle,
                 details={"reason": "guardrail_stop", "action": decision.action},
             )
-            break
+            return RecoveryAgentResult(
+                case_id=case_id, trigger=trigger,
+                cycles_executed=cycles_executed,
+                final_action=final_action, final_outcome=final_outcome,
+                stopped_reason="guardrail_stop",
+                ai_reasoning=ai_reasoning,
+            )
 
         # ── ACT ─────────────────────────────────────────────────────
         action_result = execute_recovery_action(
@@ -252,19 +260,58 @@ def run_recovery_agent(
         )
 
         # ── OBSERVE RESULT ──────────────────────────────────────────
-
-        # CONTACT → payment link created → stop, wait for webhook.
-        if decision.action == "contact":
+        if action_result.outcome == "recovered":
             _audit_agent_event(
                 db, case_id, "recovery_agent_stopped",
                 trigger=trigger, cycle=cycle,
-                details={"reason": "contact_pending_webhook"},
+                details={"reason": "recovered"},
+            )
+            return RecoveryAgentResult(
+                case_id=case_id, trigger=trigger,
+                cycles_executed=cycles_executed,
+                final_action=final_action, final_outcome="recovered",
+                stopped_reason="recovered",
+                ai_reasoning=ai_reasoning,
+            )
+
+        # CONTACT or RETRY → payment link created/reused & notification handled → stop, wait for webhook.
+        if decision.action in {"contact", "retry"}:
+            if action_result.outcome == "blocked":
+                _audit_agent_event(
+                    db, case_id, "recovery_agent_stopped",
+                    trigger=trigger, cycle=cycle,
+                    details={
+                        "reason": "action_blocked",
+                        "guardrails": action_result.guardrails_applied,
+                    },
+                )
+                return RecoveryAgentResult(
+                    case_id=case_id, trigger=trigger,
+                    cycles_executed=cycles_executed,
+                    final_action=final_action, final_outcome=final_outcome,
+                    stopped_reason="action_blocked",
+                    ai_reasoning=ai_reasoning,
+                )
+
+            if action_result.outcome == "failed":
+                _audit_agent_event(
+                    db, case_id, "recovery_agent_continuation",
+                    trigger=trigger, cycle=cycle,
+                    details={"reason": f"{decision.action}_failed_continuing"},
+                )
+                continue
+
+            stopped_reason = f"{decision.action}_pending_webhook"
+            _audit_agent_event(
+                db, case_id, "recovery_agent_stopped",
+                trigger=trigger, cycle=cycle,
+                details={"reason": stopped_reason},
             )
             return RecoveryAgentResult(
                 case_id=case_id, trigger=trigger,
                 cycles_executed=cycles_executed,
                 final_action=final_action, final_outcome=final_outcome,
-                stopped_reason="contact_pending_webhook",
+                stopped_reason=stopped_reason,
                 ai_reasoning=ai_reasoning,
             )
 
@@ -297,47 +344,6 @@ def run_recovery_agent(
                 stopped_reason="recovery_closed",
                 ai_reasoning=ai_reasoning,
             )
-
-        # RETRY → check outcome.
-        if action_result.outcome == "recovered":
-            _audit_agent_event(
-                db, case_id, "recovery_agent_stopped",
-                trigger=trigger, cycle=cycle,
-                details={"reason": "recovered"},
-            )
-            return RecoveryAgentResult(
-                case_id=case_id, trigger=trigger,
-                cycles_executed=cycles_executed,
-                final_action=final_action, final_outcome=final_outcome,
-                stopped_reason="recovered",
-                ai_reasoning=ai_reasoning,
-            )
-
-        if action_result.outcome == "blocked":
-            _audit_agent_event(
-                db, case_id, "recovery_agent_stopped",
-                trigger=trigger, cycle=cycle,
-                details={
-                    "reason": "action_blocked",
-                    "guardrails": action_result.guardrails_applied,
-                },
-            )
-            return RecoveryAgentResult(
-                case_id=case_id, trigger=trigger,
-                cycles_executed=cycles_executed,
-                final_action=final_action, final_outcome=final_outcome,
-                stopped_reason="action_blocked",
-                ai_reasoning=ai_reasoning,
-            )
-
-        # RETRY failed but may continue → log continuation, next iteration.
-        if action_result.outcome == "failed":
-            _audit_agent_event(
-                db, case_id, "recovery_agent_continuation",
-                trigger=trigger, cycle=cycle,
-                details={"reason": "retry_failed_continuing"},
-            )
-            continue
 
         # Unexpected outcome → stop safely.
         logger.warning(

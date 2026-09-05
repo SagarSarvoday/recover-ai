@@ -15,6 +15,7 @@ class RazorpayPaymentLinkRequest(BaseModel):
     customer_name: str | None = Field(default=None, max_length=100)
     customer_email: str | None = Field(default=None, max_length=254)
     customer_contact: str | None = Field(default=None, max_length=20)
+    expire_by: int | None = Field(default=None, description="UNIX timestamp in seconds for link expiry.")
 
 
 class RazorpayPaymentLinkResult(BaseModel):
@@ -23,6 +24,7 @@ class RazorpayPaymentLinkResult(BaseModel):
     status: str | None = None
     amount: int
     currency: str
+    expire_by: int | None = None
     raw_response: dict[str, Any]
 
 

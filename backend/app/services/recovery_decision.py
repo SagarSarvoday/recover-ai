@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -21,9 +22,21 @@ from app.schemas.recovery_analysis import (
     RecoveryDecisionContext,
 )
 
-SYSTEM_PROMPT = """You are a revenue recovery decision engine. Your job is to recommend the safest next recovery action for a failed payment. You do not execute actions. You must choose exactly one allowed action. Minimize unnecessary customer contact, avoid repeated retries, respect stopping rules, and explain your reasoning briefly.
+SYSTEM_PROMPT = """You are a revenue recovery decision engine. Your job is to recommend the safest next recovery action for a failed payment. You do not execute actions or interact with payment gateways. You must choose exactly one allowed action. Minimize unnecessary customer contact, avoid repeated retries, respect stopping rules, and explain your reasoning briefly.
 
-Consider the complete supplied context: current payment, revenue at risk, customer payment history, prior recovery outcomes, and previous attempt logs. Do NOT merely repeat or restate the provider's failure_reason in your explanation (for example, do not just output "Temporary issue with payment processing"). Your `reason` field MUST contain genuine analytical reasoning synthesized from the supplied context (e.g. customer's history of successful payments, transient nature of failure, absence/presence of prior attempts, amount at risk). Do not manufacture facts absent from the context. Never suggest payment execution, database operations, arbitrary code, or contacting the customer directly. Return only the required JSON object."""
+Allowed actions:
+- 'retry': Generate or reuse a secure Razorpay recovery payment link and notify the customer by email. This does NOT execute a direct charge or mark payment successful.
+- 'contact': Generate or reuse a secure Razorpay recovery payment link and notify the customer by email.
+- 'wait': Defer recovery action until a future scheduled time. Requires wait_minutes (1-10080).
+- 'skip': Do not initiate recovery at this time.
+- 'close': Permanently close recovery (e.g. max attempts reached, unrecoverable card/account).
+
+CRITICAL RULES FOR SCHEDULING AND RECOVERY LIFECYCLE:
+1. When `is_scheduled_followup` is true or `wait_elapsed` is true, the scheduled wait interval has ALREADY completed. You must conduct a FRESH REASSESSMENT of the recovery context. Do NOT blindly repeat 'wait'. Repeating 'wait' is only permitted if there is an explicit newly discovered delayed dependency.
+2. The fact that the previous decision was 'wait' must NEVER by itself justify another 'wait'.
+3. Successful payment must NEVER be inferred or assumed by the LLM. Only verified incoming payment webhooks from the payment gateway confirm recovery.
+4. If an active payment link already exists and has not expired, 'retry' or 'contact' will safely reuse that link. If the payment link has expired (`is_payment_link_expired` is true), a fresh link is required.
+5. Your `reason` field MUST contain genuine analytical reasoning synthesized from the supplied context (e.g. past successful transactions, failure reason nature, elapsed wait interval, remaining attempts, revenue at risk). Do not merely repeat the provider's raw failure_reason."""
 
 ACTION_NEXT_STEPS = {
     "retry": "Retry the payment once",
@@ -35,7 +48,7 @@ ACTION_NEXT_STEPS = {
 
 SYSTEM_PROMPT += """
 
-Your `next_step` must be semantically consistent with your selected `action`. Use these action-aligned next steps: retry = \"Retry the payment once\"; contact = \"Contact the customer with a payment link\"; wait = \"Wait for the validated interval, then perform one controlled retry\"; skip = \"Do not initiate recovery\"; close = \"Stop recovery\". For action `wait`, you MUST provide an integer `wait_minutes` between 1 and 10080. The scheduled follow-up is one controlled retry; do not return wait_minutes for any other action."""
+Your `next_step` must be semantically consistent with your selected `action`. Use these action-aligned next steps: retry = "Retry the payment once"; contact = "Contact the customer with a payment link"; wait = "Wait for the validated interval, then perform one controlled retry"; skip = "Do not initiate recovery"; close = "Stop recovery". For action `wait`, you MUST provide an integer `wait_minutes` between 1 and 10080. Do not return wait_minutes for any other action. Return only the required JSON object matching the schema."""
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +109,11 @@ def build_recovery_context(
     customer: Customer | None,
     payment: Payment,
     max_recovery_attempts: int,
+    *,
+    trigger: str = "manual",
+    now: datetime | None = None,
 ) -> RecoveryDecisionContext:
+    now = now or datetime.now(timezone.utc)
     payment_history = []
     prior_cases = []
     if customer is not None:
@@ -127,6 +144,44 @@ def build_recovery_context(
             paid_at=item.paid_at,
             created_at=item.created_at,
         )
+
+    # Lifecycle and scheduling computations
+    scheduled_action = getattr(case, "scheduled_action", None)
+    scheduled_at = getattr(case, "next_action_at", None)
+    if scheduled_at is not None and scheduled_at.tzinfo is None:
+        scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+
+    is_scheduled_due = bool(scheduled_at and scheduled_at <= now)
+    is_scheduled_followup = trigger in {"scheduled_action", "scheduled_worker"}
+    wait_elapsed = is_scheduled_followup or (
+        case.ai_decision == "wait" and (is_scheduled_due or scheduled_at is None)
+    )
+
+    active_link_id = getattr(case, "razorpay_payment_link_id", None)
+    link_expires_at = getattr(case, "payment_link_expires_at", None)
+    if link_expires_at is not None and link_expires_at.tzinfo is None:
+        link_expires_at = link_expires_at.replace(tzinfo=timezone.utc)
+
+    is_link_expired = False
+    if active_link_id is not None:
+        if link_expires_at is not None:
+            is_link_expired = link_expires_at <= now
+        else:
+            # Fallback for links created before explicit expiry column: 48h from attempt or creation
+            ref_dt = case.last_attempt_at or case.created_at
+            if ref_dt is not None:
+                if ref_dt.tzinfo is None:
+                    ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+                is_link_expired = (ref_dt + timedelta(hours=48)) <= now
+
+    last_notif_status: str | None = None
+    last_notif_reason: str | None = None
+    for log in audit_logs:
+        if log.action in ("notification_sent", "notification_failed"):
+            last_notif_status = "sent" if log.action == "notification_sent" else "failed"
+            if isinstance(log.details, dict):
+                last_notif_reason = log.details.get("reason")
+            break
 
     return RecoveryDecisionContext(
         case_id=case.id,
@@ -161,6 +216,18 @@ def build_recovery_context(
             )
             for item in audit_logs
         ],
+        trigger=trigger,
+        is_scheduled_followup=is_scheduled_followup,
+        scheduled_action=scheduled_action,
+        scheduled_at=scheduled_at,
+        current_time=now,
+        is_scheduled_due=is_scheduled_due,
+        wait_elapsed=wait_elapsed,
+        active_payment_link_id=active_link_id,
+        payment_link_expires_at=link_expires_at,
+        is_payment_link_expired=is_link_expired,
+        last_notification_status=last_notif_status,
+        last_notification_failure_reason=last_notif_reason,
     )
 
 
@@ -218,6 +285,7 @@ def apply_guardrails(
     decision: RecoveryDecision,
     case: RecoveryCase,
     max_recovery_attempts: int,
+    context: RecoveryDecisionContext | None = None,
 ) -> tuple[RecoveryDecision, list[str]]:
     guardrails_applied: list[str] = []
 
@@ -247,6 +315,21 @@ def apply_guardrails(
             guardrails_applied,
         )
 
+    # Prevent infinite wait loops when wait interval has already completed
+    if decision.action == "wait" and context is not None and context.wait_elapsed:
+        guardrails_applied.append("infinite_wait_loop_prevented")
+        fallback_action = "retry" if case.attempt_count < max_recovery_attempts else "close"
+        return (
+            RecoveryDecision(
+                action=fallback_action,
+                reason="Scheduled wait interval has elapsed; continuing active recovery to prevent an infinite wait loop.",
+                confidence=0.85,
+                next_step=ACTION_NEXT_STEPS[fallback_action],
+                stop=(fallback_action == "close"),
+            ),
+            guardrails_applied,
+        )
+
     return decision, guardrails_applied
 
 
@@ -260,6 +343,7 @@ def persist_analysis(
     analyzed_at = datetime.now(timezone.utc)
     case.ai_decision = decision.action
     case.ai_decision_note = decision.reason
+    case.ai_confidence = Decimal(str(round(decision.confidence, 2)))
     case.ai_wait_minutes = decision.wait_minutes
     _sync_wait_followup_schedule(db, case, decision, analyzed_at)
     db.add(

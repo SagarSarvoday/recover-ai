@@ -1,13 +1,15 @@
+from decimal import Decimal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.config import settings
 from app.core.security import get_current_merchant
+from app.models.audit_log import AuditLog
 from app.models.customer import Customer
 from app.models.merchant import Merchant
 from app.models.payment import Payment
@@ -52,20 +54,85 @@ def _get_owned_recovery_case(db: Session, case_id: UUID, merchant_id: UUID) -> R
 @router.get(
     "/recovery-cases",
     response_model=list[RecoveryCaseResponse],
-    summary="List all recovery cases",
+    summary="List all recovery cases with filtering and sorting",
 )
 def list_recovery_cases(
     db: Session = Depends(get_db),
     current_merchant: Merchant = Depends(get_current_merchant),
+    *,
+    status: str | None = Query(None, description="Filter by status (comma-separated or single)"),
+    ai_decision: str | None = Query(None, description="Filter by AI decision"),
+    payment_link_status: str | None = Query(None, description="Filter by link status: not_created, active, expired, paid"),
+    customer_query: str | None = Query(None, description="Search customer name, email, or phone"),
+    min_amount: Decimal | None = Query(None, description="Minimum amount at risk"),
+    max_amount: Decimal | None = Query(None, description="Maximum amount at risk"),
+    sort_by: str = Query("newest_failure", description="Sort by: newest_failure, highest_risk, oldest_unresolved, next_action"),
 ) -> list[RecoveryCaseResponse]:
     try:
-        rows = db.execute(
+        stmt = (
             select(RecoveryCase, Customer, Payment)
             .outerjoin(Customer, RecoveryCase.customer_id == Customer.id)
             .join(Payment, RecoveryCase.payment_id == Payment.id)
             .where(RecoveryCase.merchant_id == current_merchant.id)
-            .order_by(RecoveryCase.created_at.desc())
-        ).all()
+        )
+
+        if isinstance(status, str) and status.strip():
+            statuses = [s.strip() for s in status.split(",") if s.strip()]
+            if statuses:
+                stmt = stmt.where(RecoveryCase.status.in_(statuses))
+
+        if isinstance(ai_decision, str) and ai_decision.strip():
+            stmt = stmt.where(RecoveryCase.ai_decision == ai_decision.strip())
+
+        if isinstance(min_amount, (int, float, Decimal)):
+            stmt = stmt.where(RecoveryCase.amount_at_risk >= min_amount)
+
+        if isinstance(max_amount, (int, float, Decimal)):
+            stmt = stmt.where(RecoveryCase.amount_at_risk <= max_amount)
+
+        if isinstance(customer_query, str) and customer_query.strip():
+            q = f"%{customer_query.strip()}%"
+            stmt = stmt.where(
+                or_(
+                    Customer.name.ilike(q),
+                    Customer.email.ilike(q),
+                    Customer.phone.ilike(q),
+                )
+            )
+
+        now = func.now()
+        if isinstance(payment_link_status, str) and payment_link_status.strip():
+            pls = payment_link_status.strip().lower()
+            if pls == "paid":
+                stmt = stmt.where(RecoveryCase.status == "recovered")
+            elif pls == "not_created":
+                stmt = stmt.where(RecoveryCase.razorpay_payment_link_id.is_(None))
+            elif pls == "expired":
+                stmt = stmt.where(
+                    RecoveryCase.status != "recovered",
+                    RecoveryCase.razorpay_payment_link_id.isnot(None),
+                    RecoveryCase.payment_link_expires_at < now,
+                )
+            elif pls == "active":
+                stmt = stmt.where(
+                    RecoveryCase.status != "recovered",
+                    RecoveryCase.razorpay_payment_link_id.isnot(None),
+                    or_(
+                        RecoveryCase.payment_link_expires_at.is_(None),
+                        RecoveryCase.payment_link_expires_at >= now,
+                    ),
+                )
+
+        if isinstance(sort_by, str) and sort_by == "highest_risk":
+            stmt = stmt.order_by(RecoveryCase.amount_at_risk.desc())
+        elif isinstance(sort_by, str) and sort_by == "oldest_unresolved":
+            stmt = stmt.order_by(RecoveryCase.created_at.asc())
+        elif isinstance(sort_by, str) and sort_by == "next_action":
+            stmt = stmt.order_by(RecoveryCase.next_action_at.asc().nulls_last())
+        else:
+            stmt = stmt.order_by(RecoveryCase.created_at.desc())
+
+        rows = db.execute(stmt).all()
     except SQLAlchemyError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -100,7 +167,7 @@ def analyze_recovery_case(
             )
 
         context = build_recovery_context(
-            db, case, customer, payment, settings.recovery_max_attempts
+            db, case, customer, payment, settings.recovery_max_attempts, trigger="manual_api"
         )
     except HTTPException:
         raise
@@ -114,7 +181,7 @@ def analyze_recovery_case(
         llm_decision = request_llm_decision(context, settings)
         llm_decision = ensure_action_consistent_next_step(llm_decision)
         decision, guardrails_applied = apply_guardrails(
-            llm_decision, case, settings.recovery_max_attempts
+            llm_decision, case, settings.recovery_max_attempts, context=context
         )
     except LLMConfigurationError as error:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from None
@@ -179,7 +246,7 @@ def execute_recovery_case(
             case.id,
             RecoveryActionExecutionContext(
                 db=db,
-                max_recovery_attempts=settings.recovery_max_attempts,
+                max_recovery_attempts=getattr(current_merchant, "max_recovery_attempts", None) or settings.recovery_max_attempts,
                 action_context=RecoveryActionContext(source="ai_recommendation"),
             ),
             wait_minutes=getattr(case, "ai_wait_minutes", None),
@@ -223,4 +290,115 @@ def run_recovery_workflow(
     return RecoveryWorkflowResponse(
         analysis=analysis,
         execution=execution,
+    )
+
+
+@router.get(
+    "/recovery-cases/{case_id}/activity",
+    response_model=list[dict],
+    summary="Get audit history and activity for a recovery case",
+)
+def get_recovery_case_activity(
+    case_id: UUID,
+    db: Session = Depends(get_db),
+    current_merchant: Merchant = Depends(get_current_merchant),
+) -> list[dict]:
+    case = _get_owned_recovery_case(db, case_id, current_merchant.id)
+    logs = db.scalars(
+        select(AuditLog)
+        .where(
+            AuditLog.entity_type == "recovery_case",
+            AuditLog.entity_id == case.id,
+        )
+        .order_by(AuditLog.created_at.desc())
+    ).all()
+    return [
+        {
+            "id": str(log.id),
+            "action": log.action,
+            "actor": log.actor,
+            "details": log.details,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        }
+        for log in logs
+    ]
+
+
+@router.post(
+    "/recovery-cases/{case_id}/actions/retry-link",
+    response_model=RecoveryActionExecutionResponse,
+    summary="Manually trigger creation/re-send of a recovery payment link to customer",
+)
+def manual_retry_payment_link(
+    case_id: UUID,
+    db: Session = Depends(get_db),
+    current_merchant: Merchant = Depends(get_current_merchant),
+) -> RecoveryActionExecutionResponse:
+    case = _get_owned_recovery_case(db, case_id, current_merchant.id)
+    try:
+        action_result = execute_recovery_action(
+            "retry",
+            case.id,
+            RecoveryActionExecutionContext(
+                db=db,
+                max_recovery_attempts=getattr(current_merchant, "max_recovery_attempts", None) or settings.recovery_max_attempts,
+                action_context=RecoveryActionContext(source="manual"),
+            ),
+        )
+    except InvalidRecoveryActionError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from None
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to record recovery link action.",
+        ) from None
+
+    return RecoveryActionExecutionResponse(
+        case_id=case.id,
+        ai_recommendation=PersistedAIRecommendation(
+            action=case.ai_decision,
+            reason=case.ai_decision_note,
+        ),
+        action_execution_result=action_result,
+    )
+
+
+@router.post(
+    "/recovery-cases/{case_id}/actions/close",
+    response_model=RecoveryActionExecutionResponse,
+    summary="Manually close a recovery case",
+)
+def manual_close_recovery_case(
+    case_id: UUID,
+    db: Session = Depends(get_db),
+    current_merchant: Merchant = Depends(get_current_merchant),
+) -> RecoveryActionExecutionResponse:
+    case = _get_owned_recovery_case(db, case_id, current_merchant.id)
+    try:
+        action_result = execute_recovery_action(
+            "close",
+            case.id,
+            RecoveryActionExecutionContext(
+                db=db,
+                max_recovery_attempts=getattr(current_merchant, "max_recovery_attempts", None) or settings.recovery_max_attempts,
+                action_context=RecoveryActionContext(source="manual"),
+            ),
+        )
+    except InvalidRecoveryActionError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from None
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to record close action.",
+        ) from None
+
+    return RecoveryActionExecutionResponse(
+        case_id=case.id,
+        ai_recommendation=PersistedAIRecommendation(
+            action=case.ai_decision,
+            reason=case.ai_decision_note,
+        ),
+        action_execution_result=action_result,
     )

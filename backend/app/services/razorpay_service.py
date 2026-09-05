@@ -82,6 +82,8 @@ class RazorpayService:
         }
         if notify:
             payload["notify"] = notify
+        if request.expire_by is not None:
+            payload["expire_by"] = request.expire_by
 
         response = self._get_client().payment_link.create(payload)
         return RazorpayPaymentLinkResult(
@@ -90,6 +92,7 @@ class RazorpayService:
             status=response.get("status"),
             amount=response.get("amount", request.amount),
             currency=response.get("currency", payload["currency"]),
+            expire_by=response.get("expire_by", request.expire_by),
             raw_response=response,
         )
 

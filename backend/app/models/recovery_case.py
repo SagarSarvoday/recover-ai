@@ -6,16 +6,17 @@ from decimal import Decimal
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, Numeric, Text, func
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.models.base import Base
+from app.services.recovery_state_machine import RecoveryCaseStatus
 
 
 class RecoveryCase(Base):
     __tablename__ = "recovery_cases"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('open', 'in_progress', 'recovered', 'closed')",
+            "status IN ('open', 'in_progress', 'waiting', 'payment_link_active', 'recovered', 'closed')",
             name="recovery_cases_status_chk",
         ),
         CheckConstraint("amount_at_risk >= 0", name="recovery_cases_amount_at_risk_chk"),
@@ -45,12 +46,17 @@ class RecoveryCase(Base):
         nullable=False,
     )
     razorpay_payment_link_id: Mapped[str | None] = mapped_column(Text, unique=True)
+    payment_link_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_link_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_link_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payment_link_paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="open")
     amount_at_risk: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     amount_recovered: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, server_default="0")
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     ai_decision: Mapped[str | None] = mapped_column(Text)
     ai_decision_note: Mapped[str | None] = mapped_column(Text)
+    ai_confidence: Mapped[Decimal | None] = mapped_column(Numeric(3, 2))
     ai_wait_minutes: Mapped[int | None] = mapped_column(Integer)
     next_action_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     scheduled_action: Mapped[str | None] = mapped_column(Text)
@@ -65,3 +71,9 @@ class RecoveryCase(Base):
     merchant: Mapped["Merchant"] = relationship(back_populates="recovery_cases")
     customer: Mapped["Customer | None"] = relationship(back_populates="recovery_cases")
     payment: Mapped["Payment"] = relationship(back_populates="recovery_case")
+
+    @validates("status")
+    def validate_status(self, key: str, value: str | RecoveryCaseStatus) -> RecoveryCaseStatus:
+        val = value.value if hasattr(value, "value") else str(value)
+        return RecoveryCaseStatus(val)
+

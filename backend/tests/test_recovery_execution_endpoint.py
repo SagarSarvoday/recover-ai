@@ -5,14 +5,16 @@ from decimal import Decimal
 from fastapi import HTTPException
 
 from app.api.v1.recovery_cases import execute_recovery_case
+from app.models.customer import Customer
 from app.models.payment import Payment
 from app.models.recovery_case import RecoveryCase
 
 
 class FakeSession:
-    def __init__(self, case: object, payment: object) -> None:
+    def __init__(self, case: object, payment: object, customer: object | None = None) -> None:
         self.case = case
         self.payment = payment
+        self.customer = customer
         self.audit_logs: list[object] = []
 
     def get(self, model: object, object_id: object) -> object | None:
@@ -20,6 +22,8 @@ class FakeSession:
             return self.case
         if model is Payment and object_id == self.payment.id:
             return self.payment
+        if model is Customer and self.customer is not None and object_id == self.customer.id:
+            return self.customer
         return None
 
     def add(self, item: object) -> None:
@@ -38,6 +42,13 @@ class RecoveryExecutionEndpointTests(unittest.TestCase):
         self.customer_id = uuid4()
         self.merchant_id = uuid4()
         self.payment_id = uuid4()
+        self.customer = SimpleNamespace(
+            id=self.customer_id,
+            merchant_id=self.merchant_id,
+            name="Test Customer",
+            email="customer@example.com",
+            phone=None,
+        )
         self.case = SimpleNamespace(
             amount_at_risk=Decimal("499.00"),
             amount_recovered=Decimal("0.00"),
@@ -53,13 +64,13 @@ class RecoveryExecutionEndpointTests(unittest.TestCase):
             razorpay_payment_link_id=None,
         )
         self.payment = SimpleNamespace(
-        id=self.payment_id,
-        customer_id=self.customer_id,
-        failure_reason="temporary bank error",
-        amount=Decimal("499.00"),
-        status="failed",
-    )
-        self.db = FakeSession(self.case, self.payment)
+            id=self.payment_id,
+            customer_id=self.customer_id,
+            failure_reason="temporary bank error",
+            amount=Decimal("499.00"),
+            status="failed",
+        )
+        self.db = FakeSession(self.case, self.payment, self.customer)
         self.merchant = SimpleNamespace(id=self.merchant_id)
 
     def execute_persisted_decision(self, action: str):
@@ -67,6 +78,7 @@ class RecoveryExecutionEndpointTests(unittest.TestCase):
         return execute_recovery_case(self.case_id, self.db, self.merchant)
 
     def test_analyzed_retry_executes_retry_tool(self) -> None:
+        self.case.razorpay_payment_link_id = "plink_existing"
         response = self.execute_persisted_decision("retry")
 
         self.assertEqual(response.ai_recommendation.action, "retry")

@@ -55,6 +55,17 @@ class FakeSession:
         self.closed = True
 
 
+class FakeRazorpayService:
+    def create_payment_link(self, request):
+        return SimpleNamespace(
+            id="plink_test_recovery_123",
+            short_url="https://rzp.io/i/recovery-test",
+            status="created",
+            amount=request.amount,
+            currency=request.currency,
+        )
+
+
 class ScheduledRecoveryActionTests(unittest.TestCase):
     def setUp(self):
         self.merchant_id = uuid4()
@@ -72,9 +83,10 @@ class ScheduledRecoveryActionTests(unittest.TestCase):
             id=self.payment_id, customer_id=self.customer_id, amount=Decimal("99.00"), currency="INR",
             status="failed", failure_reason="temporary bank error", paid_at=None,
         )
-        self.customer = SimpleNamespace(id=self.customer_id, name="Test", email="test@example.com", phone=None)
+        self.customer = SimpleNamespace(id=self.customer_id, merchant_id=self.merchant_id, name="Test", email="test@example.com", phone=None)
         self.db = FakeSession(self.case, self.payment, self.customer, merchant=self.merchant)
-        self.context = RecoveryActionExecutionContext(db=self.db, max_recovery_attempts=3)
+        self.razorpay_service = FakeRazorpayService()
+        self.context = RecoveryActionExecutionContext(db=self.db, max_recovery_attempts=3, razorpay_service=self.razorpay_service)
 
     def test_wait_with_validated_timing_persists_a_retry_job(self):
         before = datetime.now(timezone.utc)
@@ -114,16 +126,16 @@ class ScheduledRecoveryActionTests(unittest.TestCase):
             executed_at=None, error_message=None,
         )
         self.db.job = job
-        execute_claimed_scheduled_action(self.db, job.id, max_recovery_attempts=3)
+        execute_claimed_scheduled_action(self.db, job.id, max_recovery_attempts=3, razorpay_service=self.razorpay_service)
         return job
 
     def test_due_job_executes_once_and_marks_completed(self):
         job = self._run_job()
         self.assertEqual(job.status, "completed")
         self.assertIsNotNone(job.executed_at)
-        self.assertEqual(self.case.status, "recovered")
+        self.assertEqual(self.case.status, "in_progress")
         attempts = self.case.attempt_count
-        execute_claimed_scheduled_action(self.db, job.id, max_recovery_attempts=3)
+        execute_claimed_scheduled_action(self.db, job.id, max_recovery_attempts=3, razorpay_service=self.razorpay_service)
         self.assertEqual(self.case.attempt_count, attempts)
 
     def test_job_does_not_execute_before_its_scheduled_time(self):
@@ -159,7 +171,9 @@ class ScheduledRecoveryActionTests(unittest.TestCase):
         claim_session = FakeSession(self.case, self.payment, self.customer, merchant=self.merchant)
         execute_session = FakeSession(self.case, self.payment, self.customer, job=job, merchant=self.merchant)
         sessions = iter([claim_session, execute_session])
-        with patch("app.services.scheduled_recovery_actions.claim_due_scheduled_actions", return_value=[job.id]):
+        fake_plink = SimpleNamespace(id="plink_test_123", short_url="https://rzp.io/i/test", status="created", amount=9900, currency="INR")
+        with patch("app.services.scheduled_recovery_actions.claim_due_scheduled_actions", return_value=[job.id]), \
+             patch("app.services.razorpay_service.RazorpayService.create_payment_link", return_value=fake_plink):
             count = run_scheduled_recovery_actions(lambda: next(sessions), max_recovery_attempts=3)
         self.assertEqual(count, 1)
         self.assertTrue(claim_session.closed)
@@ -178,6 +192,7 @@ class ScheduledRecoveryActionTests(unittest.TestCase):
             trigger="scheduled_action",
             max_recovery_attempts=3,
             settings=unittest.mock.ANY,
+            razorpay_service=self.razorpay_service,
         )
 
     def test_scheduler_continuation_skips_agent_when_merchant_agent_disabled(self):

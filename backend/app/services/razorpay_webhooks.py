@@ -19,6 +19,7 @@ from app.models.razorpay_webhook_event import RazorpayWebhookEvent
 from app.models.transaction import Transaction
 from app.schemas.razorpay import RazorpayWebhookEnvelope
 from app.services.recovery_agent import run_recovery_agent
+from app.services.recovery_state_machine import transition_case_status
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,8 @@ class RazorpayPaidPaymentLinkData:
     payment_link_id: str
     successful_payment_id: str
     amount: Decimal
+    customer_id: str | None = None
+    customer_email: str | None = None
 
 
 def extract_external_entity_id(webhook: RazorpayWebhookEnvelope) -> str | None:
@@ -200,10 +203,24 @@ def extract_paid_payment_link_data(webhook: RazorpayWebhookEnvelope) -> Razorpay
     if not isinstance(amount, int) or amount <= 0:
         raise IncompleteRazorpayPaymentPayloadError("Missing or invalid successful payment amount.")
 
+    link_customer = payment_link.get("customer", {})
+    customer_id = (
+        link_customer.get("id")
+        if isinstance(link_customer, dict) and link_customer.get("id")
+        else payment.get("customer_id")
+    )
+    customer_email = _usable_email(
+        link_customer.get("email")
+        if isinstance(link_customer, dict) and link_customer.get("email")
+        else payment.get("email")
+    )
+
     return RazorpayPaidPaymentLinkData(
         payment_link_id=payment_link_id,
         successful_payment_id=successful_payment_id,
         amount=Decimal(amount) / Decimal("100"),
+        customer_id=customer_id if isinstance(customer_id, str) else None,
+        customer_email=customer_email,
     )
 
 
@@ -468,6 +485,37 @@ def ingest_payment_link_paid_webhook(
         )
         return "ignored" if inserted else "duplicate"
 
+    # Reject mismatched customer payloads
+    if recovery_case.customer_id is not None:
+        case_customer = db.get(Customer, recovery_case.customer_id)
+        if case_customer is not None:
+            if (
+                data.customer_id
+                and case_customer.razorpay_customer_id
+                and data.customer_id != case_customer.razorpay_customer_id
+            ):
+                inserted = record_webhook_event(
+                    db,
+                    razorpay_event_id=razorpay_event_id,
+                    event_type=webhook.event,
+                    external_entity_id=data.payment_link_id,
+                    processing_status="ignored",
+                )
+                return "ignored" if inserted else "duplicate"
+            if (
+                data.customer_email
+                and case_customer.email
+                and data.customer_email.lower() != case_customer.email.lower()
+            ):
+                inserted = record_webhook_event(
+                    db,
+                    razorpay_event_id=razorpay_event_id,
+                    event_type=webhook.event,
+                    external_entity_id=data.payment_link_id,
+                    processing_status="ignored",
+                )
+                return "ignored" if inserted else "duplicate"
+
     claimed = claim_webhook_event(
         db,
         razorpay_event_id=razorpay_event_id,
@@ -484,15 +532,31 @@ def ingest_payment_link_paid_webhook(
             "Matching recovery case is missing its internal payment record."
         )
 
+    now = datetime.now(timezone.utc)
     already_recovered = recovery_case.status == "recovered"
     payment.status = "succeeded"
     payment.failure_reason = None
-    payment.paid_at = datetime.now(timezone.utc)
+    payment.paid_at = now
     payment.razorpay_success_payment_id = data.successful_payment_id
 
     if not already_recovered:
+        recovery_case.payment_link_paid_at = now
         recovery_case.amount_recovered = min(recovery_case.amount_at_risk, data.amount)
-        recovery_case.status = "recovered"
+        if str(recovery_case.status) in ("open", "in_progress"):
+            transition_case_status(
+                recovery_case,
+                "payment_link_active",
+                db=db,
+                reason="payment_link_active_pre_recovery",
+                actor="razorpay_webhook",
+            )
+        transition_case_status(
+            recovery_case,
+            "recovered",
+            db=db,
+            reason="payment_link_paid_webhook",
+            actor="razorpay_webhook",
+        )
 
     db.add(
         AuditLog(
